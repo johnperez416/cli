@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/pkg/cmdutil"
 )
 
 type check struct {
@@ -15,6 +16,9 @@ type check struct {
 	CompletedAt time.Time `json:"completedAt"`
 	Link        string    `json:"link"`
 	Bucket      string    `json:"bucket"`
+	Event       string    `json:"event"`
+	Workflow    string    `json:"workflow"`
+	Description string    `json:"description"`
 }
 
 type checkCounts struct {
@@ -22,6 +26,11 @@ type checkCounts struct {
 	Passed   int
 	Pending  int
 	Skipping int
+	Canceled int
+}
+
+func (ch *check) ExportData(fields []string) map[string]interface{} {
+	return cmdutil.StructExportData(ch, fields)
 }
 
 func aggregateChecks(checkContexts []api.CheckContext, requiredChecks bool) (checks []check, counts checkCounts) {
@@ -30,10 +39,10 @@ func aggregateChecks(checkContexts []api.CheckContext, requiredChecks bool) (che
 			continue
 		}
 
-		state := c.State
+		state := string(c.State)
 		if state == "" {
 			if c.Status == "COMPLETED" {
-				state = c.Conclusion
+				state = string(c.Conclusion)
 			} else {
 				state = c.Status
 			}
@@ -55,7 +64,11 @@ func aggregateChecks(checkContexts []api.CheckContext, requiredChecks bool) (che
 			StartedAt:   c.StartedAt,
 			CompletedAt: c.CompletedAt,
 			Link:        link,
+			Event:       c.CheckSuite.WorkflowRun.Event,
+			Workflow:    c.CheckSuite.WorkflowRun.Workflow.Name,
+			Description: c.Description,
 		}
+
 		switch state {
 		case "SUCCESS":
 			item.Bucket = "pass"
@@ -63,9 +76,12 @@ func aggregateChecks(checkContexts []api.CheckContext, requiredChecks bool) (che
 		case "SKIPPED", "NEUTRAL":
 			item.Bucket = "skipping"
 			counts.Skipping++
-		case "ERROR", "FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED":
+		case "ERROR", "FAILURE", "TIMED_OUT", "ACTION_REQUIRED":
 			item.Bucket = "fail"
 			counts.Failed++
+		case "CANCELLED":
+			item.Bucket = "cancel"
+			counts.Canceled++
 		default: // "EXPECTED", "REQUESTED", "WAITING", "QUEUED", "PENDING", "IN_PROGRESS", "STALE"
 			item.Bucket = "pending"
 			counts.Pending++
@@ -91,7 +107,7 @@ func eliminateDuplicates(checkContexts []api.CheckContext) []api.CheckContext {
 			}
 			mapContexts[ctx.Context] = struct{}{}
 		} else {
-			key := fmt.Sprintf("%s/%s", ctx.Name, ctx.CheckSuite.WorkflowRun.Workflow.Name)
+			key := fmt.Sprintf("%s/%s/%s", ctx.Name, ctx.CheckSuite.WorkflowRun.Workflow.Name, ctx.CheckSuite.WorkflowRun.Event)
 			if _, exists := mapChecks[key]; exists {
 				continue
 			}

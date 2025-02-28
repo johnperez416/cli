@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/gh"
 	"github.com/cli/cli/v2/internal/prompter"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
@@ -14,7 +14,7 @@ import (
 
 type DeleteOptions struct {
 	IO         *iostreams.IOStreams
-	Config     func() (config.Config, error)
+	Config     func() (gh.Config, error)
 	HttpClient func() (*http.Client, error)
 
 	KeyID     string
@@ -38,7 +38,7 @@ func NewCmdDelete(f *cmdutil.Factory, runF func(*DeleteOptions) error) *cobra.Co
 			opts.KeyID = args[0]
 
 			if !opts.IO.CanPrompt() && !opts.Confirmed {
-				return cmdutil.FlagErrorf("--confirm required when not running interactively")
+				return cmdutil.FlagErrorf("--yes required when not running interactively")
 			}
 
 			if runF != nil {
@@ -48,7 +48,9 @@ func NewCmdDelete(f *cmdutil.Factory, runF func(*DeleteOptions) error) *cobra.Co
 		},
 	}
 
-	cmd.Flags().BoolVarP(&opts.Confirmed, "confirm", "y", false, "Skip the confirmation prompt")
+	cmd.Flags().BoolVar(&opts.Confirmed, "confirm", false, "Skip the confirmation prompt")
+	_ = cmd.Flags().MarkDeprecated("confirm", "use `--yes` instead")
+	cmd.Flags().BoolVarP(&opts.Confirmed, "yes", "y", false, "Skip the confirmation prompt")
 	return cmd
 }
 
@@ -63,7 +65,7 @@ func deleteRun(opts *DeleteOptions) error {
 		return err
 	}
 
-	host, _ := cfg.DefaultHost()
+	host, _ := cfg.Authentication().DefaultHost()
 	gpgKeys, err := getGPGKeys(httpClient, host)
 	if err != nil {
 		return err
@@ -89,7 +91,7 @@ func deleteRun(opts *DeleteOptions) error {
 
 	err = deleteGPGKey(httpClient, host, id)
 	if err != nil {
-		return nil
+		return err
 	}
 
 	if opts.IO.IsStdoutTTY() {

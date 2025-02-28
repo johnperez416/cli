@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/gh"
 	"github.com/cli/cli/v2/internal/prompter"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/httpmock"
@@ -32,7 +33,7 @@ func TestNewCmdDelete(t *testing.T) {
 		{
 			name:   "confirm flag tty",
 			tty:    true,
-			input:  "123 --confirm",
+			input:  "123 --yes",
 			output: DeleteOptions{KeyID: "123", Confirmed: true},
 		},
 		{
@@ -45,11 +46,11 @@ func TestNewCmdDelete(t *testing.T) {
 			name:       "no tty",
 			input:      "123",
 			wantErr:    true,
-			wantErrMsg: "--confirm required when not running interactively",
+			wantErrMsg: "--yes required when not running interactively",
 		},
 		{
 			name:   "confirm flag no tty",
-			input:  "123 --confirm",
+			input:  "123 --yes",
 			output: DeleteOptions{KeyID: "123", Confirmed: true},
 		},
 		{
@@ -187,7 +188,7 @@ func Test_deleteRun(t *testing.T) {
 		tt.opts.HttpClient = func() (*http.Client, error) {
 			return &http.Client{Transport: reg}, nil
 		}
-		tt.opts.Config = func() (config.Config, error) {
+		tt.opts.Config = func() (gh.Config, error) {
 			return config.NewBlankConfig(), nil
 		}
 		ios, _, stdout, _ := iostreams.Test()

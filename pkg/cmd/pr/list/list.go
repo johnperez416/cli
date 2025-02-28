@@ -11,11 +11,11 @@ import (
 	"github.com/cli/cli/v2/api"
 	"github.com/cli/cli/v2/internal/browser"
 	"github.com/cli/cli/v2/internal/ghrepo"
+	"github.com/cli/cli/v2/internal/tableprinter"
 	"github.com/cli/cli/v2/internal/text"
 	"github.com/cli/cli/v2/pkg/cmd/pr/shared"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
-	"github.com/cli/cli/v2/utils"
 	"github.com/spf13/cobra"
 )
 
@@ -55,24 +55,24 @@ func NewCmdList(f *cmdutil.Factory, runF func(*ListOptions) error) *cobra.Comman
 		Use:   "list",
 		Short: "List pull requests in a repository",
 		Long: heredoc.Doc(`
-			List pull requests in a GitHub repository.
+			List pull requests in a GitHub repository. By default, this only lists open PRs.
 
 			The search query syntax is documented here:
 			<https://docs.github.com/en/search-github/searching-on-github/searching-issues-and-pull-requests>
 		`),
 		Example: heredoc.Doc(`
-			List PRs authored by you
+			# List PRs authored by you
 			$ gh pr list --author "@me"
 
-			List only PRs with all of the given labels
+			# List only PRs with all of the given labels
 			$ gh pr list --label bug --label "priority 1"
 
-			Filter PRs using search syntax
+			# Filter PRs using search syntax
 			$ gh pr list --search "status:success review:required"
 
-			Find a PR that introduced a given commit
+			# Find a PR that introduced a given commit
 			$ gh pr list --search "<SHA>" --state merged
-    	`),
+		`),
 		Aliases: []string{"ls"},
 		Args:    cmdutil.NoArgsQuoteReminder,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -109,8 +109,9 @@ func NewCmdList(f *cmdutil.Factory, runF func(*ListOptions) error) *cobra.Comman
 	cmd.Flags().StringVarP(&opts.Assignee, "assignee", "a", "", "Filter by assignee")
 	cmd.Flags().StringVarP(&opts.Search, "search", "S", "", "Search pull requests with `query`")
 	cmdutil.NilBoolFlag(cmd, &opts.Draft, "draft", "d", "Filter by draft state")
-
 	cmdutil.AddJSONFlags(cmd, &opts.Exporter, api.PullRequestFields)
+
+	_ = cmdutil.RegisterBranchCompletionFlags(f.GitClient, cmd, "base", "head")
 
 	return cmd
 }
@@ -198,25 +199,32 @@ func listRun(opts *ListOptions) error {
 	}
 
 	cs := opts.IO.ColorScheme()
-	//nolint:staticcheck // SA1019: utils.NewTablePrinter is deprecated: use internal/tableprinter
-	table := utils.NewTablePrinter(opts.IO)
+	isTTY := opts.IO.IsStdoutTTY()
+
+	headers := []string{
+		"ID",
+		"TITLE",
+		"BRANCH",
+	}
+	if !isTTY {
+		headers = append(headers, "STATE")
+	}
+	headers = append(headers, "CREATED AT")
+
+	table := tableprinter.New(opts.IO, tableprinter.WithHeader(headers...))
 	for _, pr := range listResult.PullRequests {
 		prNum := strconv.Itoa(pr.Number)
-		if table.IsTTY() {
+		if isTTY {
 			prNum = "#" + prNum
 		}
 
-		table.AddField(prNum, nil, cs.ColorFromString(shared.ColorForPRState(pr)))
-		table.AddField(text.RemoveExcessiveWhitespace(pr.Title), nil, nil)
-		table.AddField(pr.HeadLabel(), nil, cs.Cyan)
-		if !table.IsTTY() {
-			table.AddField(prStateWithDraft(&pr), nil, nil)
+		table.AddField(prNum, tableprinter.WithColor(cs.ColorFromString(shared.ColorForPRState(pr))))
+		table.AddField(text.RemoveExcessiveWhitespace(pr.Title))
+		table.AddField(pr.HeadLabel(), tableprinter.WithColor(cs.Cyan))
+		if !isTTY {
+			table.AddField(shared.PrStateWithDraft(&pr))
 		}
-		if table.IsTTY() {
-			table.AddField(text.FuzzyAgo(opts.Now(), pr.CreatedAt), nil, cs.Gray)
-		} else {
-			table.AddField(pr.CreatedAt.String(), nil, nil)
-		}
+		table.AddTimeField(opts.Now(), pr.CreatedAt, cs.Gray)
 		table.EndRow()
 	}
 	err = table.Render()
@@ -225,12 +233,4 @@ func listRun(opts *ListOptions) error {
 	}
 
 	return nil
-}
-
-func prStateWithDraft(pr *api.PullRequest) string {
-	if pr.IsDraft && pr.State == "OPEN" {
-		return "DRAFT"
-	}
-
-	return pr.State
 }

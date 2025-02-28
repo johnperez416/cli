@@ -3,12 +3,20 @@ package git
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 
-	"github.com/cli/cli/v2/internal/run"
+	"github.com/MakeNowJust/heredoc"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestClientCommand(t *testing.T) {
@@ -58,27 +66,45 @@ func TestClientAuthenticatedCommand(t *testing.T) {
 	tests := []struct {
 		name     string
 		path     string
+		pattern  CredentialPattern
 		wantArgs []string
+		wantErr  error
 	}{
 		{
-			name:     "adds credential helper config options",
+			name:     "when credential pattern allows for anything, credential helper matches everything",
 			path:     "path/to/gh",
-			wantArgs: []string{"git", "-c", "credential.helper=", "-c", "credential.helper=!\"path/to/gh\" auth git-credential", "fetch"},
+			pattern:  AllMatchingCredentialsPattern,
+			wantArgs: []string{"path/to/git", "-c", "credential.helper=", "-c", `credential.helper=!"path/to/gh" auth git-credential`, "fetch"},
+		},
+		{
+			name:     "when credential pattern is set, credential helper only matches that pattern",
+			path:     "path/to/gh",
+			pattern:  CredentialPattern{pattern: "https://github.com"},
+			wantArgs: []string{"path/to/git", "-c", "credential.https://github.com.helper=", "-c", `credential.https://github.com.helper=!"path/to/gh" auth git-credential`, "fetch"},
 		},
 		{
 			name:     "fallback when GhPath is not set",
-			wantArgs: []string{"git", "-c", "credential.helper=", "-c", "credential.helper=!\"gh\" auth git-credential", "fetch"},
+			pattern:  AllMatchingCredentialsPattern,
+			wantArgs: []string{"path/to/git", "-c", "credential.helper=", "-c", `credential.helper=!"gh" auth git-credential`, "fetch"},
+		},
+		{
+			name:    "errors when attempting to use an empty pattern that isn't marked all matching",
+			pattern: CredentialPattern{allMatching: false, pattern: ""},
+			wantErr: fmt.Errorf("empty credential pattern is not allowed unless provided explicitly"),
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client := Client{
 				GhPath:  tt.path,
-				GitPath: "git",
+				GitPath: "path/to/git",
 			}
-			cmd, err := client.AuthenticatedCommand(context.Background(), "fetch")
-			assert.NoError(t, err)
-			assert.Equal(t, tt.wantArgs, cmd.Args)
+			cmd, err := client.AuthenticatedCommand(context.Background(), tt.pattern, "fetch")
+			if tt.wantErr != nil {
+				require.Equal(t, tt.wantErr, err)
+				return
+			}
+			require.Equal(t, tt.wantArgs, cmd.Args)
 		})
 	}
 }
@@ -122,7 +148,7 @@ func TestClientRemotes(t *testing.T) {
 	assert.Equal(t, "other", rs[3].Resolved)
 }
 
-func TestClientRemotesNoResolvedRemote(t *testing.T) {
+func TestClientRemotes_no_resolved_remote(t *testing.T) {
 	tempDir := t.TempDir()
 	initRepo(t, tempDir)
 	gitDir := filepath.Join(tempDir, ".git")
@@ -192,6 +218,495 @@ func TestParseRemotes(t *testing.T) {
 	assert.Equal(t, "/koke/grit.git", r[4].PushURL.Path)
 }
 
+func TestClientUpdateRemoteURL(t *testing.T) {
+	tests := []struct {
+		name          string
+		cmdExitStatus int
+		cmdStdout     string
+		cmdStderr     string
+		wantCmdArgs   string
+		wantErrorMsg  string
+	}{
+		{
+			name:        "update remote url",
+			wantCmdArgs: `path/to/git remote set-url test https://test.com`,
+		},
+		{
+			name:          "git error",
+			cmdExitStatus: 1,
+			cmdStderr:     "git error message",
+			wantCmdArgs:   `path/to/git remote set-url test https://test.com`,
+			wantErrorMsg:  "failed to run git: git error message",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, cmdCtx := createCommandContext(t, tt.cmdExitStatus, tt.cmdStdout, tt.cmdStderr)
+			client := Client{
+				GitPath:        "path/to/git",
+				commandContext: cmdCtx,
+			}
+			err := client.UpdateRemoteURL(context.Background(), "test", "https://test.com")
+			assert.Equal(t, tt.wantCmdArgs, strings.Join(cmd.Args[3:], " "))
+			if tt.wantErrorMsg == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.EqualError(t, err, tt.wantErrorMsg)
+			}
+		})
+	}
+}
+
+func TestClientSetRemoteResolution(t *testing.T) {
+	tests := []struct {
+		name          string
+		cmdExitStatus int
+		cmdStdout     string
+		cmdStderr     string
+		wantCmdArgs   string
+		wantErrorMsg  string
+	}{
+		{
+			name:        "set remote resolution",
+			wantCmdArgs: `path/to/git config --add remote.origin.gh-resolved base`,
+		},
+		{
+			name:          "git error",
+			cmdExitStatus: 1,
+			cmdStderr:     "git error message",
+			wantCmdArgs:   `path/to/git config --add remote.origin.gh-resolved base`,
+			wantErrorMsg:  "failed to run git: git error message",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, cmdCtx := createCommandContext(t, tt.cmdExitStatus, tt.cmdStdout, tt.cmdStderr)
+			client := Client{
+				GitPath:        "path/to/git",
+				commandContext: cmdCtx,
+			}
+			err := client.SetRemoteResolution(context.Background(), "origin", "base")
+			assert.Equal(t, tt.wantCmdArgs, strings.Join(cmd.Args[3:], " "))
+			if tt.wantErrorMsg == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.EqualError(t, err, tt.wantErrorMsg)
+			}
+		})
+	}
+}
+
+func TestClientCurrentBranch(t *testing.T) {
+	tests := []struct {
+		name          string
+		cmdExitStatus int
+		cmdStdout     string
+		cmdStderr     string
+		wantCmdArgs   string
+		wantErrorMsg  string
+		wantBranch    string
+	}{
+		{
+			name:        "branch name",
+			cmdStdout:   "branch-name\n",
+			wantCmdArgs: `path/to/git symbolic-ref --quiet HEAD`,
+			wantBranch:  "branch-name",
+		},
+		{
+			name:        "ref",
+			cmdStdout:   "refs/heads/branch-name\n",
+			wantCmdArgs: `path/to/git symbolic-ref --quiet HEAD`,
+			wantBranch:  "branch-name",
+		},
+		{
+			name:        "escaped ref",
+			cmdStdout:   "refs/heads/branch\u00A0with\u00A0non\u00A0breaking\u00A0space\n",
+			wantCmdArgs: `path/to/git symbolic-ref --quiet HEAD`,
+			wantBranch:  "branch\u00A0with\u00A0non\u00A0breaking\u00A0space",
+		},
+		{
+			name:          "detached head",
+			cmdExitStatus: 1,
+			wantCmdArgs:   `path/to/git symbolic-ref --quiet HEAD`,
+			wantErrorMsg:  "failed to run git: not on any branch",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, cmdCtx := createCommandContext(t, tt.cmdExitStatus, tt.cmdStdout, tt.cmdStderr)
+			client := Client{
+				GitPath:        "path/to/git",
+				commandContext: cmdCtx,
+			}
+			branch, err := client.CurrentBranch(context.Background())
+			assert.Equal(t, tt.wantCmdArgs, strings.Join(cmd.Args[3:], " "))
+			if tt.wantErrorMsg == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.EqualError(t, err, tt.wantErrorMsg)
+			}
+			assert.Equal(t, tt.wantBranch, branch)
+		})
+	}
+}
+
+func TestClientShowRefs(t *testing.T) {
+	tests := []struct {
+		name          string
+		cmdExitStatus int
+		cmdStdout     string
+		cmdStderr     string
+		wantCmdArgs   string
+		wantRefs      []Ref
+		wantErrorMsg  string
+	}{
+		{
+			name:          "show refs with one valid ref and one invalid ref",
+			cmdExitStatus: 128,
+			cmdStdout:     "9ea76237a557015e73446d33268569a114c0649c refs/heads/valid",
+			cmdStderr:     "fatal: 'refs/heads/invalid' - not a valid ref",
+			wantCmdArgs:   `path/to/git show-ref --verify -- refs/heads/valid refs/heads/invalid`,
+			wantRefs: []Ref{{
+				Hash: "9ea76237a557015e73446d33268569a114c0649c",
+				Name: "refs/heads/valid",
+			}},
+			wantErrorMsg: "failed to run git: fatal: 'refs/heads/invalid' - not a valid ref",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, cmdCtx := createCommandContext(t, tt.cmdExitStatus, tt.cmdStdout, tt.cmdStderr)
+			client := Client{
+				GitPath:        "path/to/git",
+				commandContext: cmdCtx,
+			}
+			refs, err := client.ShowRefs(context.Background(), []string{"refs/heads/valid", "refs/heads/invalid"})
+			assert.Equal(t, tt.wantCmdArgs, strings.Join(cmd.Args[3:], " "))
+			assert.EqualError(t, err, tt.wantErrorMsg)
+			assert.Equal(t, tt.wantRefs, refs)
+		})
+	}
+}
+
+func TestClientConfig(t *testing.T) {
+	tests := []struct {
+		name          string
+		cmdExitStatus int
+		cmdStdout     string
+		cmdStderr     string
+		wantCmdArgs   string
+		wantOut       string
+		wantErrorMsg  string
+	}{
+		{
+			name:        "get config key",
+			cmdStdout:   "test",
+			wantCmdArgs: `path/to/git config credential.helper`,
+			wantOut:     "test",
+		},
+		{
+			name:          "get unknown config key",
+			cmdExitStatus: 1,
+			cmdStderr:     "git error message",
+			wantCmdArgs:   `path/to/git config credential.helper`,
+			wantErrorMsg:  "failed to run git: unknown config key credential.helper",
+		},
+		{
+			name:          "git error",
+			cmdExitStatus: 2,
+			cmdStderr:     "git error message",
+			wantCmdArgs:   `path/to/git config credential.helper`,
+			wantErrorMsg:  "failed to run git: git error message",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, cmdCtx := createCommandContext(t, tt.cmdExitStatus, tt.cmdStdout, tt.cmdStderr)
+			client := Client{
+				GitPath:        "path/to/git",
+				commandContext: cmdCtx,
+			}
+			out, err := client.Config(context.Background(), "credential.helper")
+			assert.Equal(t, tt.wantCmdArgs, strings.Join(cmd.Args[3:], " "))
+			if tt.wantErrorMsg == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.EqualError(t, err, tt.wantErrorMsg)
+			}
+			assert.Equal(t, tt.wantOut, out)
+		})
+	}
+}
+
+func TestClientUncommittedChangeCount(t *testing.T) {
+	tests := []struct {
+		name            string
+		cmdExitStatus   int
+		cmdStdout       string
+		cmdStderr       string
+		wantCmdArgs     string
+		wantChangeCount int
+	}{
+		{
+			name:            "no changes",
+			wantCmdArgs:     `path/to/git status --porcelain`,
+			wantChangeCount: 0,
+		},
+		{
+			name:            "one change",
+			cmdStdout:       " M poem.txt",
+			wantCmdArgs:     `path/to/git status --porcelain`,
+			wantChangeCount: 1,
+		},
+		{
+			name:            "untracked file",
+			cmdStdout:       " M poem.txt\n?? new.txt",
+			wantCmdArgs:     `path/to/git status --porcelain`,
+			wantChangeCount: 2,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, cmdCtx := createCommandContext(t, tt.cmdExitStatus, tt.cmdStdout, tt.cmdStderr)
+			client := Client{
+				GitPath:        "path/to/git",
+				commandContext: cmdCtx,
+			}
+			ucc, err := client.UncommittedChangeCount(context.Background())
+			assert.Equal(t, tt.wantCmdArgs, strings.Join(cmd.Args[3:], " "))
+			assert.NoError(t, err)
+			assert.Equal(t, tt.wantChangeCount, ucc)
+		})
+	}
+}
+
+type stubbedCommit struct {
+	Sha   string
+	Title string
+	Body  string
+}
+
+type stubbedCommitsCommandData struct {
+	ExitStatus int
+
+	ErrMsg string
+
+	Commits []stubbedCommit
+}
+
+func TestClientCommits(t *testing.T) {
+	tests := []struct {
+		name         string
+		testData     stubbedCommitsCommandData
+		wantCmdArgs  string
+		wantCommits  []*Commit
+		wantErrorMsg string
+	}{
+		{
+			name: "single commit no body",
+			testData: stubbedCommitsCommandData{
+				Commits: []stubbedCommit{
+					{
+						Sha:   "6a6872b918c601a0e730710ad8473938a7516d30",
+						Title: "testing testability test",
+						Body:  "",
+					},
+				},
+			},
+			wantCmdArgs: `path/to/git -c log.ShowSignature=false log --pretty=format:%H%x00%s%x00%b%x00 --cherry SHA1...SHA2`,
+			wantCommits: []*Commit{{
+				Sha:   "6a6872b918c601a0e730710ad8473938a7516d30",
+				Title: "testing testability test",
+			}},
+		},
+		{
+			name: "single commit with body",
+			testData: stubbedCommitsCommandData{
+				Commits: []stubbedCommit{
+					{
+						Sha:   "6a6872b918c601a0e730710ad8473938a7516d30",
+						Title: "testing testability test",
+						Body:  "This is the body",
+					},
+				},
+			},
+			wantCmdArgs: `path/to/git -c log.ShowSignature=false log --pretty=format:%H%x00%s%x00%b%x00 --cherry SHA1...SHA2`,
+			wantCommits: []*Commit{{
+				Sha:   "6a6872b918c601a0e730710ad8473938a7516d30",
+				Title: "testing testability test",
+				Body:  "This is the body",
+			}},
+		},
+		{
+			name: "multiple commits with bodies",
+			testData: stubbedCommitsCommandData{
+				Commits: []stubbedCommit{
+					{
+						Sha:   "6a6872b918c601a0e730710ad8473938a7516d30",
+						Title: "testing testability test",
+						Body:  "This is the body",
+					},
+					{
+						Sha:   "7a6872b918c601a0e730710ad8473938a7516d31",
+						Title: "testing testability test 2",
+						Body:  "This is the body 2",
+					},
+				},
+			},
+			wantCmdArgs: `path/to/git -c log.ShowSignature=false log --pretty=format:%H%x00%s%x00%b%x00 --cherry SHA1...SHA2`,
+			wantCommits: []*Commit{
+				{
+					Sha:   "6a6872b918c601a0e730710ad8473938a7516d30",
+					Title: "testing testability test",
+					Body:  "This is the body",
+				},
+				{
+					Sha:   "7a6872b918c601a0e730710ad8473938a7516d31",
+					Title: "testing testability test 2",
+					Body:  "This is the body 2",
+				},
+			},
+		},
+		{
+			name: "multiple commits mixed bodies",
+			testData: stubbedCommitsCommandData{
+				Commits: []stubbedCommit{
+					{
+						Sha:   "6a6872b918c601a0e730710ad8473938a7516d30",
+						Title: "testing testability test",
+					},
+					{
+						Sha:   "7a6872b918c601a0e730710ad8473938a7516d31",
+						Title: "testing testability test 2",
+						Body:  "This is the body 2",
+					},
+				},
+			},
+			wantCmdArgs: `path/to/git -c log.ShowSignature=false log --pretty=format:%H%x00%s%x00%b%x00 --cherry SHA1...SHA2`,
+			wantCommits: []*Commit{
+				{
+					Sha:   "6a6872b918c601a0e730710ad8473938a7516d30",
+					Title: "testing testability test",
+				},
+				{
+					Sha:   "7a6872b918c601a0e730710ad8473938a7516d31",
+					Title: "testing testability test 2",
+					Body:  "This is the body 2",
+				},
+			},
+		},
+		{
+			name: "multiple commits newlines in bodies",
+			testData: stubbedCommitsCommandData{
+				Commits: []stubbedCommit{
+					{
+						Sha:   "6a6872b918c601a0e730710ad8473938a7516d30",
+						Title: "testing testability test",
+						Body:  "This is the body\nwith a newline",
+					},
+					{
+						Sha:   "7a6872b918c601a0e730710ad8473938a7516d31",
+						Title: "testing testability test 2",
+						Body:  "This is the body 2",
+					},
+				},
+			},
+			wantCmdArgs: `path/to/git -c log.ShowSignature=false log --pretty=format:%H%x00%s%x00%b%x00 --cherry SHA1...SHA2`,
+			wantCommits: []*Commit{
+				{
+					Sha:   "6a6872b918c601a0e730710ad8473938a7516d30",
+					Title: "testing testability test",
+					Body:  "This is the body\nwith a newline",
+				},
+				{
+					Sha:   "7a6872b918c601a0e730710ad8473938a7516d31",
+					Title: "testing testability test 2",
+					Body:  "This is the body 2",
+				},
+			},
+		},
+		{
+			name: "no commits between SHAs",
+			testData: stubbedCommitsCommandData{
+				Commits: []stubbedCommit{},
+			},
+			wantCmdArgs:  `path/to/git -c log.ShowSignature=false log --pretty=format:%H%x00%s%x00%b%x00 --cherry SHA1...SHA2`,
+			wantErrorMsg: "could not find any commits between SHA1 and SHA2",
+		},
+		{
+			name: "git error",
+			testData: stubbedCommitsCommandData{
+				ErrMsg:     "git error message",
+				ExitStatus: 1,
+			},
+			wantCmdArgs:  `path/to/git -c log.ShowSignature=false log --pretty=format:%H%x00%s%x00%b%x00 --cherry SHA1...SHA2`,
+			wantErrorMsg: "failed to run git: git error message",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, cmdCtx := createCommitsCommandContext(t, tt.testData)
+			client := Client{
+				GitPath:        "path/to/git",
+				commandContext: cmdCtx,
+			}
+			commits, err := client.Commits(context.Background(), "SHA1", "SHA2")
+			require.Equal(t, tt.wantCmdArgs, strings.Join(cmd.Args[3:], " "))
+			if tt.wantErrorMsg != "" {
+				require.EqualError(t, err, tt.wantErrorMsg)
+			} else {
+				require.NoError(t, err)
+			}
+			require.Equal(t, tt.wantCommits, commits)
+		})
+	}
+}
+
+func TestCommitsHelperProcess(t *testing.T) {
+	if os.Getenv("GH_WANT_HELPER_PROCESS") != "1" {
+		return
+	}
+
+	var td stubbedCommitsCommandData
+	_ = json.Unmarshal([]byte(os.Getenv("GH_COMMITS_TEST_DATA")), &td)
+
+	if td.ErrMsg != "" {
+		fmt.Fprint(os.Stderr, td.ErrMsg)
+	} else {
+		var sb strings.Builder
+		for _, commit := range td.Commits {
+			sb.WriteString(commit.Sha)
+			sb.WriteString("\u0000")
+			sb.WriteString(commit.Title)
+			sb.WriteString("\u0000")
+			sb.WriteString(commit.Body)
+			sb.WriteString("\u0000")
+			sb.WriteString("\n")
+		}
+		fmt.Fprint(os.Stdout, sb.String())
+	}
+
+	os.Exit(td.ExitStatus)
+}
+
+func createCommitsCommandContext(t *testing.T, testData stubbedCommitsCommandData) (*exec.Cmd, commandCtx) {
+	t.Helper()
+
+	b, err := json.Marshal(testData)
+	require.NoError(t, err)
+
+	cmd := exec.CommandContext(context.Background(), os.Args[0], "-test.run=TestCommitsHelperProcess", "--")
+	cmd.Env = []string{
+		"GH_WANT_HELPER_PROCESS=1",
+		"GH_COMMITS_TEST_DATA=" + string(b),
+	}
+	return cmd, func(ctx context.Context, exe string, args ...string) *exec.Cmd {
+		cmd.Args = append(cmd.Args, exe)
+		cmd.Args = append(cmd.Args, args...)
+		return cmd
+	}
+}
+
 func TestClientLastCommit(t *testing.T) {
 	client := Client{
 		RepoDir: "./fixtures/simple.git",
@@ -211,83 +726,1021 @@ func TestClientCommitBody(t *testing.T) {
 	assert.Equal(t, "I'm starting to get the hang of things\n", body)
 }
 
-func TestClientUncommittedChangeCount(t *testing.T) {
+func TestClientReadBranchConfig(t *testing.T) {
 	tests := []struct {
-		name     string
-		expected int
-		output   string
+		name             string
+		cmds             mockedCommands
+		branch           string
+		wantBranchConfig BranchConfig
+		wantError        *GitError
 	}{
 		{
-			name:     "no changes",
-			expected: 0,
-			output:   "",
+			name: "when the git config has no (remote|merge|pushremote|gh-merge-base) keys, it should return an empty BranchConfig and no error",
+			cmds: mockedCommands{
+				`path/to/git config --get-regexp ^branch\.trunk\.(remote|merge|pushremote|gh-merge-base)$`: {
+					ExitStatus: 1,
+				},
+			},
+			branch:           "trunk",
+			wantBranchConfig: BranchConfig{},
+			wantError:        nil,
 		},
 		{
-			name:     "one change",
-			expected: 1,
-			output:   " M poem.txt",
+			name: "when the git fails to read the config, it should return an empty BranchConfig and the error",
+			cmds: mockedCommands{
+				`path/to/git config --get-regexp ^branch\.trunk\.(remote|merge|pushremote|gh-merge-base)$`: {
+					ExitStatus: 2,
+					Stderr:     "git error",
+				},
+			},
+			branch:           "trunk",
+			wantBranchConfig: BranchConfig{},
+			wantError: &GitError{
+				ExitCode: 2,
+				Stderr:   "git error",
+			},
 		},
 		{
-			name:     "untracked file",
-			expected: 2,
-			output:   " M poem.txt\n?? new.txt",
+			name: "when the config is read, it should return the correct BranchConfig",
+			cmds: mockedCommands{
+				`path/to/git config --get-regexp ^branch\.trunk\.(remote|merge|pushremote|gh-merge-base)$`: {
+					Stdout: heredoc.Doc(`
+						branch.trunk.remote upstream
+						branch.trunk.merge refs/heads/trunk
+						branch.trunk.pushremote origin
+						branch.trunk.gh-merge-base gh-merge-base
+					`),
+				},
+			},
+			branch: "trunk",
+			wantBranchConfig: BranchConfig{
+				RemoteName:     "upstream",
+				PushRemoteName: "origin",
+				MergeRef:       "refs/heads/trunk",
+				MergeBase:      "gh-merge-base",
+			},
+			wantError: nil,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cs, restore := run.Stub()
-			defer restore(t)
-			cs.Register(`git status --porcelain`, 0, tt.output)
-			client := Client{}
-			ucc, err := client.UncommittedChangeCount(context.Background())
-			assert.NoError(t, err)
-			assert.Equal(t, tt.expected, ucc)
+			cmdCtx := createMockedCommandContext(t, tt.cmds)
+			client := Client{
+				GitPath:        "path/to/git",
+				commandContext: cmdCtx,
+			}
+			branchConfig, err := client.ReadBranchConfig(context.Background(), tt.branch)
+			if tt.wantError != nil {
+				var gitError *GitError
+				require.ErrorAs(t, err, &gitError)
+				assert.Equal(t, tt.wantError.ExitCode, gitError.ExitCode)
+				assert.Equal(t, tt.wantError.Stderr, gitError.Stderr)
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tt.wantBranchConfig, branchConfig)
 		})
 	}
 }
 
-func TestClientCurrentBranch(t *testing.T) {
+func Test_parseBranchConfig(t *testing.T) {
 	tests := []struct {
-		name     string
-		stub     string
-		expected string
+		name             string
+		configLines      []string
+		wantBranchConfig BranchConfig
 	}{
 		{
-			name:     "branch name",
-			stub:     "branch-name\n",
-			expected: "branch-name",
+			name:        "remote branch",
+			configLines: []string{"branch.trunk.remote origin"},
+			wantBranchConfig: BranchConfig{
+				RemoteName: "origin",
+			},
 		},
 		{
-			name:     "ref",
-			stub:     "refs/heads/branch-name\n",
-			expected: "branch-name",
+			name:        "merge ref",
+			configLines: []string{"branch.trunk.merge refs/heads/trunk"},
+			wantBranchConfig: BranchConfig{
+				MergeRef: "refs/heads/trunk",
+			},
 		},
 		{
-			name:     "escaped ref",
-			stub:     "refs/heads/branch\u00A0with\u00A0non\u00A0breaking\u00A0space\n",
-			expected: "branch\u00A0with\u00A0non\u00A0breaking\u00A0space",
+			name:        "merge base",
+			configLines: []string{"branch.trunk.gh-merge-base gh-merge-base"},
+			wantBranchConfig: BranchConfig{
+				MergeBase: "gh-merge-base",
+			},
+		},
+		{
+			name:        "pushremote",
+			configLines: []string{"branch.trunk.pushremote pushremote"},
+			wantBranchConfig: BranchConfig{
+				PushRemoteName: "pushremote",
+			},
+		},
+		{
+			name: "remote and pushremote are specified by name",
+			configLines: []string{
+				"branch.trunk.remote upstream",
+				"branch.trunk.pushremote origin",
+			},
+			wantBranchConfig: BranchConfig{
+				RemoteName:     "upstream",
+				PushRemoteName: "origin",
+			},
+		},
+		{
+			name: "remote and pushremote are specified by url",
+			configLines: []string{
+				"branch.trunk.remote git@github.com:UPSTREAMOWNER/REPO.git",
+				"branch.trunk.pushremote git@github.com:ORIGINOWNER/REPO.git",
+			},
+			wantBranchConfig: BranchConfig{
+				RemoteURL: &url.URL{
+					Scheme: "ssh",
+					User:   url.User("git"),
+					Host:   "github.com",
+					Path:   "/UPSTREAMOWNER/REPO.git",
+				},
+				PushRemoteURL: &url.URL{
+					Scheme: "ssh",
+					User:   url.User("git"),
+					Host:   "github.com",
+					Path:   "/ORIGINOWNER/REPO.git",
+				},
+			},
+		},
+		{
+			name: "remote, pushremote, gh-merge-base, and merge ref all specified",
+			configLines: []string{
+				"branch.trunk.remote remote",
+				"branch.trunk.pushremote pushremote",
+				"branch.trunk.gh-merge-base gh-merge-base",
+				"branch.trunk.merge refs/heads/trunk",
+			},
+			wantBranchConfig: BranchConfig{
+				RemoteName:     "remote",
+				PushRemoteName: "pushremote",
+				MergeBase:      "gh-merge-base",
+				MergeRef:       "refs/heads/trunk",
+			},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cs, teardown := run.Stub()
-			defer teardown(t)
-			cs.Register(`git symbolic-ref --quiet HEAD`, 0, tt.stub)
-			client := Client{}
-			branch, err := client.CurrentBranch(context.Background())
-			assert.NoError(t, err)
-			assert.Equal(t, tt.expected, branch)
+			branchConfig := parseBranchConfig(tt.configLines)
+			assert.Equalf(t, tt.wantBranchConfig.RemoteName, branchConfig.RemoteName, "unexpected RemoteName")
+			assert.Equalf(t, tt.wantBranchConfig.MergeRef, branchConfig.MergeRef, "unexpected MergeRef")
+			assert.Equalf(t, tt.wantBranchConfig.MergeBase, branchConfig.MergeBase, "unexpected MergeBase")
+			assert.Equalf(t, tt.wantBranchConfig.PushRemoteName, branchConfig.PushRemoteName, "unexpected PushRemoteName")
+			if tt.wantBranchConfig.RemoteURL != nil {
+				assert.Equalf(t, tt.wantBranchConfig.RemoteURL.String(), branchConfig.RemoteURL.String(), "unexpected RemoteURL")
+			}
+			if tt.wantBranchConfig.PushRemoteURL != nil {
+				assert.Equalf(t, tt.wantBranchConfig.PushRemoteURL.String(), branchConfig.PushRemoteURL.String(), "unexpected PushRemoteURL")
+			}
 		})
 	}
 }
 
-func TestClientCurrentBranch_detached_head(t *testing.T) {
-	cs, teardown := run.Stub()
-	defer teardown(t)
-	cs.Register(`git symbolic-ref --quiet HEAD`, 1, "")
-	client := Client{}
-	_, err := client.CurrentBranch(context.Background())
-	assert.EqualError(t, err, "failed to run git: not on any branch")
+func Test_parseRemoteURLOrName(t *testing.T) {
+	tests := []struct {
+		name           string
+		value          string
+		wantRemoteURL  *url.URL
+		wantRemoteName string
+	}{
+		{
+			name:           "empty value",
+			value:          "",
+			wantRemoteURL:  nil,
+			wantRemoteName: "",
+		},
+		{
+			name:  "remote URL",
+			value: "git@github.com:foo/bar.git",
+			wantRemoteURL: &url.URL{
+				Scheme: "ssh",
+				User:   url.User("git"),
+				Host:   "github.com",
+				Path:   "/foo/bar.git",
+			},
+			wantRemoteName: "",
+		},
+		{
+			name:           "remote name",
+			value:          "origin",
+			wantRemoteURL:  nil,
+			wantRemoteName: "origin",
+		},
+		{
+			name:           "remote name is from filesystem",
+			value:          "./path/to/repo",
+			wantRemoteURL:  nil,
+			wantRemoteName: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			remoteURL, remoteName := parseRemoteURLOrName(tt.value)
+			assert.Equal(t, tt.wantRemoteURL, remoteURL)
+			assert.Equal(t, tt.wantRemoteName, remoteName)
+		})
+	}
+}
+
+func TestClientPushDefault(t *testing.T) {
+	tests := []struct {
+		name            string
+		commandResult   commandResult
+		wantPushDefault string
+		wantError       *GitError
+	}{
+		{
+			name: "push default is not set",
+			commandResult: commandResult{
+				ExitStatus: 1,
+				Stderr:     "error: key does not contain a section: remote.pushDefault",
+			},
+			wantPushDefault: "simple",
+			wantError:       nil,
+		},
+		{
+			name: "push default is set to current",
+			commandResult: commandResult{
+				ExitStatus: 0,
+				Stdout:     "current",
+			},
+			wantPushDefault: "current",
+			wantError:       nil,
+		},
+		{
+			name: "push default errors",
+			commandResult: commandResult{
+				ExitStatus: 128,
+				Stderr:     "fatal: git error",
+			},
+			wantPushDefault: "",
+			wantError: &GitError{
+				ExitCode: 128,
+				Stderr:   "fatal: git error",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmdCtx := createMockedCommandContext(t, mockedCommands{
+				`path/to/git config push.default`: tt.commandResult,
+			},
+			)
+			client := Client{
+				GitPath:        "path/to/git",
+				commandContext: cmdCtx,
+			}
+			pushDefault, err := client.PushDefault(context.Background())
+			if tt.wantError != nil {
+				var gitError *GitError
+				require.ErrorAs(t, err, &gitError)
+				assert.Equal(t, tt.wantError.ExitCode, gitError.ExitCode)
+				assert.Equal(t, tt.wantError.Stderr, gitError.Stderr)
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tt.wantPushDefault, pushDefault)
+		})
+	}
+}
+
+func TestClientRemotePushDefault(t *testing.T) {
+	tests := []struct {
+		name                  string
+		commandResult         commandResult
+		wantRemotePushDefault string
+		wantError             *GitError
+	}{
+		{
+			name: "remote.pushDefault is not set",
+			commandResult: commandResult{
+				ExitStatus: 1,
+				Stderr:     "error: key does not contain a section: remote.pushDefault",
+			},
+			wantRemotePushDefault: "",
+			wantError:             nil,
+		},
+		{
+			name: "remote.pushDefault is set to origin",
+			commandResult: commandResult{
+				ExitStatus: 0,
+				Stdout:     "origin",
+			},
+			wantRemotePushDefault: "origin",
+			wantError:             nil,
+		},
+		{
+			name: "remote.pushDefault errors",
+			commandResult: commandResult{
+				ExitStatus: 128,
+				Stderr:     "fatal: git error",
+			},
+			wantRemotePushDefault: "",
+			wantError: &GitError{
+				ExitCode: 128,
+				Stderr:   "fatal: git error",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmdCtx := createMockedCommandContext(t, mockedCommands{
+				`path/to/git config remote.pushDefault`: tt.commandResult,
+			},
+			)
+			client := Client{
+				GitPath:        "path/to/git",
+				commandContext: cmdCtx,
+			}
+			pushDefault, err := client.RemotePushDefault(context.Background())
+			if tt.wantError != nil {
+				var gitError *GitError
+				require.ErrorAs(t, err, &gitError)
+				assert.Equal(t, tt.wantError.ExitCode, gitError.ExitCode)
+				assert.Equal(t, tt.wantError.Stderr, gitError.Stderr)
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tt.wantRemotePushDefault, pushDefault)
+		})
+	}
+}
+
+func TestClientParsePushRevision(t *testing.T) {
+	tests := []struct {
+		name                   string
+		branch                 string
+		commandResult          commandResult
+		wantParsedPushRevision string
+		wantError              *GitError
+	}{
+		{
+			name:   "@{push} resolves to origin/branchName",
+			branch: "branchName",
+			commandResult: commandResult{
+				ExitStatus: 0,
+				Stdout:     "origin/branchName",
+			},
+			wantParsedPushRevision: "origin/branchName",
+		},
+		{
+			name: "@{push} doesn't resolve",
+			commandResult: commandResult{
+				ExitStatus: 128,
+				Stderr:     "fatal: git error",
+			},
+			wantParsedPushRevision: "",
+			wantError: &GitError{
+				ExitCode: 128,
+				Stderr:   "fatal: git error",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := fmt.Sprintf("path/to/git rev-parse --abbrev-ref %s@{push}", tt.branch)
+			cmdCtx := createMockedCommandContext(t, mockedCommands{
+				args(cmd): tt.commandResult,
+			})
+			client := Client{
+				GitPath:        "path/to/git",
+				commandContext: cmdCtx,
+			}
+			pushDefault, err := client.ParsePushRevision(context.Background(), tt.branch)
+			if tt.wantError != nil {
+				var gitError *GitError
+				require.ErrorAs(t, err, &gitError)
+				assert.Equal(t, tt.wantError.ExitCode, gitError.ExitCode)
+				assert.Equal(t, tt.wantError.Stderr, gitError.Stderr)
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tt.wantParsedPushRevision, pushDefault)
+		})
+	}
+}
+
+func TestClientDeleteLocalTag(t *testing.T) {
+	tests := []struct {
+		name          string
+		cmdExitStatus int
+		cmdStdout     string
+		cmdStderr     string
+		wantCmdArgs   string
+		wantErrorMsg  string
+	}{
+		{
+			name:        "delete local tag",
+			wantCmdArgs: `path/to/git tag -d v1.0`,
+		},
+		{
+			name:          "git error",
+			cmdExitStatus: 1,
+			cmdStderr:     "git error message",
+			wantCmdArgs:   `path/to/git tag -d v1.0`,
+			wantErrorMsg:  "failed to run git: git error message",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, cmdCtx := createCommandContext(t, tt.cmdExitStatus, tt.cmdStdout, tt.cmdStderr)
+			client := Client{
+				GitPath:        "path/to/git",
+				commandContext: cmdCtx,
+			}
+			err := client.DeleteLocalTag(context.Background(), "v1.0")
+			assert.Equal(t, tt.wantCmdArgs, strings.Join(cmd.Args[3:], " "))
+			if tt.wantErrorMsg == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.EqualError(t, err, tt.wantErrorMsg)
+			}
+		})
+	}
+}
+
+func TestClientDeleteLocalBranch(t *testing.T) {
+	tests := []struct {
+		name          string
+		cmdExitStatus int
+		cmdStdout     string
+		cmdStderr     string
+		wantCmdArgs   string
+		wantErrorMsg  string
+	}{
+		{
+			name:        "delete local branch",
+			wantCmdArgs: `path/to/git branch -D trunk`,
+		},
+		{
+			name:          "git error",
+			cmdExitStatus: 1,
+			cmdStderr:     "git error message",
+			wantCmdArgs:   `path/to/git branch -D trunk`,
+			wantErrorMsg:  "failed to run git: git error message",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, cmdCtx := createCommandContext(t, tt.cmdExitStatus, tt.cmdStdout, tt.cmdStderr)
+			client := Client{
+				GitPath:        "path/to/git",
+				commandContext: cmdCtx,
+			}
+			err := client.DeleteLocalBranch(context.Background(), "trunk")
+			assert.Equal(t, tt.wantCmdArgs, strings.Join(cmd.Args[3:], " "))
+			if tt.wantErrorMsg == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.EqualError(t, err, tt.wantErrorMsg)
+			}
+		})
+	}
+}
+
+func TestClientHasLocalBranch(t *testing.T) {
+	tests := []struct {
+		name          string
+		cmdExitStatus int
+		cmdStdout     string
+		cmdStderr     string
+		wantCmdArgs   string
+		wantOut       bool
+	}{
+		{
+			name:        "has local branch",
+			wantCmdArgs: `path/to/git rev-parse --verify refs/heads/trunk`,
+			wantOut:     true,
+		},
+		{
+			name:          "does not have local branch",
+			cmdExitStatus: 1,
+			wantCmdArgs:   `path/to/git rev-parse --verify refs/heads/trunk`,
+			wantOut:       false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, cmdCtx := createCommandContext(t, tt.cmdExitStatus, tt.cmdStdout, tt.cmdStderr)
+			client := Client{
+				GitPath:        "path/to/git",
+				commandContext: cmdCtx,
+			}
+			out := client.HasLocalBranch(context.Background(), "trunk")
+			assert.Equal(t, tt.wantCmdArgs, strings.Join(cmd.Args[3:], " "))
+			assert.Equal(t, out, tt.wantOut)
+		})
+	}
+}
+
+func TestClientCheckoutBranch(t *testing.T) {
+	tests := []struct {
+		name          string
+		cmdExitStatus int
+		cmdStdout     string
+		cmdStderr     string
+		wantCmdArgs   string
+		wantErrorMsg  string
+	}{
+		{
+			name:        "checkout branch",
+			wantCmdArgs: `path/to/git checkout trunk`,
+		},
+		{
+			name:          "git error",
+			cmdExitStatus: 1,
+			cmdStderr:     "git error message",
+			wantCmdArgs:   `path/to/git checkout trunk`,
+			wantErrorMsg:  "failed to run git: git error message",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, cmdCtx := createCommandContext(t, tt.cmdExitStatus, tt.cmdStdout, tt.cmdStderr)
+			client := Client{
+				GitPath:        "path/to/git",
+				commandContext: cmdCtx,
+			}
+			err := client.CheckoutBranch(context.Background(), "trunk")
+			assert.Equal(t, tt.wantCmdArgs, strings.Join(cmd.Args[3:], " "))
+			if tt.wantErrorMsg == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.EqualError(t, err, tt.wantErrorMsg)
+			}
+		})
+	}
+}
+
+func TestClientCheckoutNewBranch(t *testing.T) {
+	tests := []struct {
+		name          string
+		cmdExitStatus int
+		cmdStdout     string
+		cmdStderr     string
+		wantCmdArgs   string
+		wantErrorMsg  string
+	}{
+		{
+			name:        "checkout new branch",
+			wantCmdArgs: `path/to/git checkout -b trunk --track origin/trunk`,
+		},
+		{
+			name:          "git error",
+			cmdExitStatus: 1,
+			cmdStderr:     "git error message",
+			wantCmdArgs:   `path/to/git checkout -b trunk --track origin/trunk`,
+			wantErrorMsg:  "failed to run git: git error message",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, cmdCtx := createCommandContext(t, tt.cmdExitStatus, tt.cmdStdout, tt.cmdStderr)
+			client := Client{
+				GitPath:        "path/to/git",
+				commandContext: cmdCtx,
+			}
+			err := client.CheckoutNewBranch(context.Background(), "origin", "trunk")
+			assert.Equal(t, tt.wantCmdArgs, strings.Join(cmd.Args[3:], " "))
+			if tt.wantErrorMsg == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.EqualError(t, err, tt.wantErrorMsg)
+			}
+		})
+	}
+}
+
+func TestClientToplevelDir(t *testing.T) {
+	tests := []struct {
+		name          string
+		cmdExitStatus int
+		cmdStdout     string
+		cmdStderr     string
+		wantCmdArgs   string
+		wantDir       string
+		wantErrorMsg  string
+	}{
+		{
+			name:        "top level dir",
+			cmdStdout:   "/path/to/repo",
+			wantCmdArgs: `path/to/git rev-parse --show-toplevel`,
+			wantDir:     "/path/to/repo",
+		},
+		{
+			name:          "git error",
+			cmdExitStatus: 1,
+			cmdStderr:     "git error message",
+			wantCmdArgs:   `path/to/git rev-parse --show-toplevel`,
+			wantErrorMsg:  "failed to run git: git error message",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, cmdCtx := createCommandContext(t, tt.cmdExitStatus, tt.cmdStdout, tt.cmdStderr)
+			client := Client{
+				GitPath:        "path/to/git",
+				commandContext: cmdCtx,
+			}
+			dir, err := client.ToplevelDir(context.Background())
+			assert.Equal(t, tt.wantCmdArgs, strings.Join(cmd.Args[3:], " "))
+			if tt.wantErrorMsg == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.EqualError(t, err, tt.wantErrorMsg)
+			}
+			assert.Equal(t, tt.wantDir, dir)
+		})
+	}
+}
+
+func TestClientGitDir(t *testing.T) {
+	tests := []struct {
+		name          string
+		cmdExitStatus int
+		cmdStdout     string
+		cmdStderr     string
+		wantCmdArgs   string
+		wantDir       string
+		wantErrorMsg  string
+	}{
+		{
+			name:        "git dir",
+			cmdStdout:   "/path/to/repo/.git",
+			wantCmdArgs: `path/to/git rev-parse --git-dir`,
+			wantDir:     "/path/to/repo/.git",
+		},
+		{
+			name:          "git error",
+			cmdExitStatus: 1,
+			cmdStderr:     "git error message",
+			wantCmdArgs:   `path/to/git rev-parse --git-dir`,
+			wantErrorMsg:  "failed to run git: git error message",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, cmdCtx := createCommandContext(t, tt.cmdExitStatus, tt.cmdStdout, tt.cmdStderr)
+			client := Client{
+				GitPath:        "path/to/git",
+				commandContext: cmdCtx,
+			}
+			dir, err := client.GitDir(context.Background())
+			assert.Equal(t, tt.wantCmdArgs, strings.Join(cmd.Args[3:], " "))
+			if tt.wantErrorMsg == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.EqualError(t, err, tt.wantErrorMsg)
+			}
+			assert.Equal(t, tt.wantDir, dir)
+		})
+	}
+}
+
+func TestClientPathFromRoot(t *testing.T) {
+	tests := []struct {
+		name          string
+		cmdExitStatus int
+		cmdStdout     string
+		cmdStderr     string
+		wantCmdArgs   string
+		wantErrorMsg  string
+		wantDir       string
+	}{
+		{
+			name:        "current path from root",
+			cmdStdout:   "some/path/",
+			wantCmdArgs: `path/to/git rev-parse --show-prefix`,
+			wantDir:     "some/path",
+		},
+		{
+			name:          "git error",
+			cmdExitStatus: 1,
+			cmdStderr:     "git error message",
+			wantCmdArgs:   `path/to/git rev-parse --show-prefix`,
+			wantDir:       "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, cmdCtx := createCommandContext(t, tt.cmdExitStatus, tt.cmdStdout, tt.cmdStderr)
+			client := Client{
+				GitPath:        "path/to/git",
+				commandContext: cmdCtx,
+			}
+			dir := client.PathFromRoot(context.Background())
+			assert.Equal(t, tt.wantCmdArgs, strings.Join(cmd.Args[3:], " "))
+			assert.Equal(t, tt.wantDir, dir)
+		})
+	}
+}
+
+func TestClientUnsetRemoteResolution(t *testing.T) {
+	tests := []struct {
+		name          string
+		cmdExitStatus int
+		cmdStdout     string
+		cmdStderr     string
+		wantCmdArgs   string
+		wantErrorMsg  string
+	}{
+		{
+			name:        "unset remote resolution",
+			wantCmdArgs: `path/to/git config --unset remote.origin.gh-resolved`,
+		},
+		{
+			name:          "git error",
+			cmdExitStatus: 1,
+			cmdStderr:     "git error message",
+			wantCmdArgs:   `path/to/git config --unset remote.origin.gh-resolved`,
+			wantErrorMsg:  "failed to run git: git error message",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, cmdCtx := createCommandContext(t, tt.cmdExitStatus, tt.cmdStdout, tt.cmdStderr)
+			client := Client{
+				GitPath:        "path/to/git",
+				commandContext: cmdCtx,
+			}
+			err := client.UnsetRemoteResolution(context.Background(), "origin")
+			assert.Equal(t, tt.wantCmdArgs, strings.Join(cmd.Args[3:], " "))
+			if tt.wantErrorMsg == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.EqualError(t, err, tt.wantErrorMsg)
+			}
+		})
+	}
+}
+
+func TestClientSetRemoteBranches(t *testing.T) {
+	tests := []struct {
+		name          string
+		cmdExitStatus int
+		cmdStdout     string
+		cmdStderr     string
+		wantCmdArgs   string
+		wantErrorMsg  string
+	}{
+		{
+			name:        "set remote branches",
+			wantCmdArgs: `path/to/git remote set-branches origin trunk`,
+		},
+		{
+			name:          "git error",
+			cmdExitStatus: 1,
+			cmdStderr:     "git error message",
+			wantCmdArgs:   `path/to/git remote set-branches origin trunk`,
+			wantErrorMsg:  "failed to run git: git error message",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, cmdCtx := createCommandContext(t, tt.cmdExitStatus, tt.cmdStdout, tt.cmdStderr)
+			client := Client{
+				GitPath:        "path/to/git",
+				commandContext: cmdCtx,
+			}
+			err := client.SetRemoteBranches(context.Background(), "origin", "trunk")
+			assert.Equal(t, tt.wantCmdArgs, strings.Join(cmd.Args[3:], " "))
+			if tt.wantErrorMsg == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.EqualError(t, err, tt.wantErrorMsg)
+			}
+		})
+	}
+}
+
+func TestClientFetch(t *testing.T) {
+	tests := []struct {
+		name         string
+		mods         []CommandModifier
+		commands     mockedCommands
+		wantErrorMsg string
+	}{
+		{
+			name: "fetch",
+			commands: map[args]commandResult{
+				`path/to/git -c credential.helper= -c credential.helper=!"gh" auth git-credential fetch origin trunk`: {
+					ExitStatus: 0,
+				},
+			},
+		},
+		{
+			name: "accepts command modifiers",
+			mods: []CommandModifier{WithRepoDir("/path/to/repo")},
+			commands: map[args]commandResult{
+				`path/to/git -C /path/to/repo -c credential.helper= -c credential.helper=!"gh" auth git-credential fetch origin trunk`: {
+					ExitStatus: 0,
+				},
+			},
+		},
+		{
+			name: "git error on fetch",
+			commands: map[args]commandResult{
+				`path/to/git -c credential.helper= -c credential.helper=!"gh" auth git-credential fetch origin trunk`: {
+					ExitStatus: 1,
+					Stderr:     "fetch error message",
+				},
+			},
+			wantErrorMsg: "failed to run git: fetch error message",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmdCtx := createMockedCommandContext(t, tt.commands)
+			client := Client{
+				GitPath:        "path/to/git",
+				commandContext: cmdCtx,
+			}
+			err := client.Fetch(context.Background(), "origin", "trunk", tt.mods...)
+			if tt.wantErrorMsg == "" {
+				require.NoError(t, err)
+			} else {
+				require.EqualError(t, err, tt.wantErrorMsg)
+			}
+		})
+	}
+}
+
+func TestClientPull(t *testing.T) {
+	tests := []struct {
+		name         string
+		mods         []CommandModifier
+		commands     mockedCommands
+		wantErrorMsg string
+	}{
+		{
+			name: "pull",
+			commands: map[args]commandResult{
+				`path/to/git -c credential.helper= -c credential.helper=!"gh" auth git-credential pull --ff-only origin trunk`: {
+					ExitStatus: 0,
+				},
+			},
+		},
+		{
+			name: "accepts command modifiers",
+			mods: []CommandModifier{WithRepoDir("/path/to/repo")},
+			commands: map[args]commandResult{
+				`path/to/git -C /path/to/repo -c credential.helper= -c credential.helper=!"gh" auth git-credential pull --ff-only origin trunk`: {
+					ExitStatus: 0,
+				},
+			},
+		},
+		{
+			name: "git error on pull",
+			commands: map[args]commandResult{
+				`path/to/git -c credential.helper= -c credential.helper=!"gh" auth git-credential pull --ff-only origin trunk`: {
+					ExitStatus: 1,
+					Stderr:     "pull error message",
+				},
+			},
+			wantErrorMsg: "failed to run git: pull error message",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmdCtx := createMockedCommandContext(t, tt.commands)
+			client := Client{
+				GitPath:        "path/to/git",
+				commandContext: cmdCtx,
+			}
+			err := client.Pull(context.Background(), "origin", "trunk", tt.mods...)
+			if tt.wantErrorMsg == "" {
+				require.NoError(t, err)
+			} else {
+				require.EqualError(t, err, tt.wantErrorMsg)
+			}
+		})
+	}
+}
+
+func TestClientPush(t *testing.T) {
+	tests := []struct {
+		name         string
+		mods         []CommandModifier
+		commands     mockedCommands
+		wantErrorMsg string
+	}{
+		{
+			name: "push",
+			commands: map[args]commandResult{
+				`path/to/git -c credential.helper= -c credential.helper=!"gh" auth git-credential push --set-upstream origin trunk`: {
+					ExitStatus: 0,
+				},
+			},
+		},
+		{
+			name: "accepts command modifiers",
+			mods: []CommandModifier{WithRepoDir("/path/to/repo")},
+			commands: map[args]commandResult{
+				`path/to/git -C /path/to/repo -c credential.helper= -c credential.helper=!"gh" auth git-credential push --set-upstream origin trunk`: {
+					ExitStatus: 0,
+				},
+			},
+		},
+		{
+			name: "git error on push",
+			commands: map[args]commandResult{
+				`path/to/git -c credential.helper= -c credential.helper=!"gh" auth git-credential push --set-upstream origin trunk`: {
+					ExitStatus: 1,
+					Stderr:     "push error message",
+				},
+			},
+			wantErrorMsg: "failed to run git: push error message",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmdCtx := createMockedCommandContext(t, tt.commands)
+			client := Client{
+				GitPath:        "path/to/git",
+				commandContext: cmdCtx,
+			}
+			err := client.Push(context.Background(), "origin", "trunk", tt.mods...)
+			if tt.wantErrorMsg == "" {
+				require.NoError(t, err)
+			} else {
+				require.EqualError(t, err, tt.wantErrorMsg)
+			}
+		})
+	}
+}
+
+func TestClientClone(t *testing.T) {
+	tests := []struct {
+		name          string
+		args          []string
+		mods          []CommandModifier
+		cmdExitStatus int
+		cmdStdout     string
+		cmdStderr     string
+		wantCmdArgs   string
+		wantTarget    string
+		wantErrorMsg  string
+	}{
+		{
+			name:        "clone",
+			args:        []string{},
+			wantCmdArgs: `path/to/git -c credential.https://github.com.helper= -c credential.https://github.com.helper=!"gh" auth git-credential clone https://github.com/cli/cli`,
+			wantTarget:  "cli",
+		},
+		{
+			name:        "accepts command modifiers",
+			args:        []string{},
+			mods:        []CommandModifier{WithRepoDir("/path/to/repo")},
+			wantCmdArgs: `path/to/git -C /path/to/repo -c credential.https://github.com.helper= -c credential.https://github.com.helper=!"gh" auth git-credential clone https://github.com/cli/cli`,
+			wantTarget:  "cli",
+		},
+		{
+			name:          "git error",
+			args:          []string{},
+			cmdExitStatus: 1,
+			cmdStderr:     "git error message",
+			wantCmdArgs:   `path/to/git -c credential.https://github.com.helper= -c credential.https://github.com.helper=!"gh" auth git-credential clone https://github.com/cli/cli`,
+			wantErrorMsg:  "failed to run git: git error message",
+		},
+		{
+			name:        "bare clone",
+			args:        []string{"--bare"},
+			wantCmdArgs: `path/to/git -c credential.https://github.com.helper= -c credential.https://github.com.helper=!"gh" auth git-credential clone --bare https://github.com/cli/cli`,
+			wantTarget:  "cli.git",
+		},
+		{
+			name:        "bare clone with explicit target",
+			args:        []string{"cli-bare", "--bare"},
+			wantCmdArgs: `path/to/git -c credential.https://github.com.helper= -c credential.https://github.com.helper=!"gh" auth git-credential clone --bare https://github.com/cli/cli cli-bare`,
+			wantTarget:  "cli-bare",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, cmdCtx := createCommandContext(t, tt.cmdExitStatus, tt.cmdStdout, tt.cmdStderr)
+			client := Client{
+				GitPath:        "path/to/git",
+				commandContext: cmdCtx,
+			}
+			target, err := client.Clone(context.Background(), "https://github.com/cli/cli", tt.args, tt.mods...)
+			assert.Equal(t, tt.wantCmdArgs, strings.Join(cmd.Args[3:], " "))
+			if tt.wantErrorMsg == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.EqualError(t, err, tt.wantErrorMsg)
+			}
+			assert.Equal(t, tt.wantTarget, target)
+		})
+	}
 }
 
 func TestParseCloneArgs(t *testing.T) {
@@ -344,39 +1797,44 @@ func TestParseCloneArgs(t *testing.T) {
 
 func TestClientAddRemote(t *testing.T) {
 	tests := []struct {
-		title    string
-		name     string
-		url      string
-		dir      string
-		branches []string
-		want     string
+		title         string
+		name          string
+		url           string
+		branches      []string
+		dir           string
+		cmdExitStatus int
+		cmdStdout     string
+		cmdStderr     string
+		wantCmdArgs   string
+		wantErrorMsg  string
 	}{
 		{
-			title:    "fetch all",
-			name:     "test",
-			url:      "URL",
-			dir:      "DIRECTORY",
-			branches: []string{},
-			want:     "git -C DIRECTORY remote add -f test URL",
+			title:       "fetch all",
+			name:        "test",
+			url:         "URL",
+			dir:         "DIRECTORY",
+			branches:    []string{},
+			wantCmdArgs: `path/to/git -C DIRECTORY remote add test URL`,
 		},
 		{
-			title:    "fetch specific branches only",
-			name:     "test",
-			url:      "URL",
-			dir:      "DIRECTORY",
-			branches: []string{"trunk", "dev"},
-			want:     "git -C DIRECTORY remote add -t trunk -t dev -f test URL",
+			title:       "fetch specific branches only",
+			name:        "test",
+			url:         "URL",
+			dir:         "DIRECTORY",
+			branches:    []string{"trunk", "dev"},
+			wantCmdArgs: `path/to/git -C DIRECTORY remote add -t trunk -t dev test URL`,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.title, func(t *testing.T) {
-			cs, cmdTeardown := run.Stub()
-			defer cmdTeardown(t)
-			cs.Register(tt.want, 0, "")
+			cmd, cmdCtx := createCommandContext(t, tt.cmdExitStatus, tt.cmdStdout, tt.cmdStderr)
 			client := Client{
-				RepoDir: tt.dir,
+				GitPath:        "path/to/git",
+				RepoDir:        tt.dir,
+				commandContext: cmdCtx,
 			}
 			_, err := client.AddRemote(context.Background(), tt.name, tt.url, tt.branches)
+			assert.Equal(t, tt.wantCmdArgs, strings.Join(cmd.Args[3:], " "))
 			assert.NoError(t, err)
 		})
 	}
@@ -396,4 +1854,173 @@ func initRepo(t *testing.T, dir string) {
 	assert.NoError(t, err)
 	_, err = cmd.Output()
 	assert.NoError(t, err)
+}
+
+type args string
+
+type commandResult struct {
+	ExitStatus int    `json:"exitStatus"`
+	Stdout     string `json:"out"`
+	Stderr     string `json:"err"`
+}
+
+type mockedCommands map[args]commandResult
+
+// TestCommandMocking is an invoked test helper that emulates expected behavior for predefined shell commands, erroring when unexpected conditions are encountered.
+func TestCommandMocking(t *testing.T) {
+	if os.Getenv("GH_WANT_HELPER_PROCESS_RICH") != "1" {
+		return
+	}
+
+	jsonVar, ok := os.LookupEnv("GH_HELPER_PROCESS_RICH_COMMANDS")
+	if !ok {
+		fmt.Fprint(os.Stderr, "missing GH_HELPER_PROCESS_RICH_COMMANDS")
+		// Exit 1 is used for empty key values in the git config. This is non-breaking in those use cases,
+		// so this is returning a non-zero exit code to avoid suppressing this error for those use cases.
+		os.Exit(16)
+	}
+
+	var commands mockedCommands
+	if err := json.Unmarshal([]byte(jsonVar), &commands); err != nil {
+		fmt.Fprint(os.Stderr, "failed to unmarshal GH_HELPER_PROCESS_RICH_COMMANDS")
+		// Exit 1 is used for empty key values in the git config. This is non-breaking in those use cases,
+		// so this is returning a non-zero exit code to avoid suppressing this error for those use cases.
+		os.Exit(16)
+	}
+
+	// The discarded args are those for the go test binary itself, e.g. `-test.run=TestHelperProcessRich`
+	realArgs := os.Args[3:]
+
+	commandResult, ok := commands[args(strings.Join(realArgs, " "))]
+	if !ok {
+		fmt.Fprintf(os.Stderr, "unexpected command: %s\n", strings.Join(realArgs, " "))
+		// Exit 1 is used for empty key values in the git config. This is non-breaking in those use cases,
+		// so this is returning a non-zero exit code to avoid suppressing this error for those use cases.
+		os.Exit(16)
+	}
+
+	if commandResult.Stdout != "" {
+		fmt.Fprint(os.Stdout, commandResult.Stdout)
+	}
+
+	if commandResult.Stderr != "" {
+		fmt.Fprint(os.Stderr, commandResult.Stderr)
+	}
+
+	os.Exit(commandResult.ExitStatus)
+}
+
+func TestHelperProcess(t *testing.T) {
+	if os.Getenv("GH_WANT_HELPER_PROCESS") != "1" {
+		return
+	}
+	if err := func(args []string) error {
+		fmt.Fprint(os.Stdout, os.Getenv("GH_HELPER_PROCESS_STDOUT"))
+		exitStatus := os.Getenv("GH_HELPER_PROCESS_EXIT_STATUS")
+		if exitStatus != "0" {
+			return errors.New("error")
+		}
+		return nil
+	}(os.Args[3:]); err != nil {
+		fmt.Fprint(os.Stderr, os.Getenv("GH_HELPER_PROCESS_STDERR"))
+		exitStatus := os.Getenv("GH_HELPER_PROCESS_EXIT_STATUS")
+		i, err := strconv.Atoi(exitStatus)
+		if err != nil {
+			os.Exit(1)
+		}
+		os.Exit(i)
+	}
+	os.Exit(0)
+}
+
+func TestCredentialPatternFromGitURL(t *testing.T) {
+	tests := []struct {
+		name                  string
+		gitURL                string
+		wantErr               bool
+		wantCredentialPattern CredentialPattern
+	}{
+		{
+			name:   "Given a well formed gitURL, it returns the corresponding CredentialPattern",
+			gitURL: "https://github.com/OWNER/REPO.git",
+			wantCredentialPattern: CredentialPattern{
+				pattern:     "https://github.com",
+				allMatching: false,
+			},
+		},
+		{
+			name: "Given a malformed gitURL, it returns an error",
+			// This pattern is copied from the tests in ParseURL
+			// Unexpectedly, a non URL-like string did not error in ParseURL
+			gitURL:  "ssh://git@[/tmp/git-repo",
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			credentialPattern, err := CredentialPatternFromGitURL(tt.gitURL)
+			if tt.wantErr {
+				assert.ErrorContains(t, err, "failed to parse remote URL")
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, tt.wantCredentialPattern, credentialPattern)
+			}
+		})
+	}
+}
+
+func TestCredentialPatternFromHost(t *testing.T) {
+	tests := []struct {
+		name                  string
+		host                  string
+		wantCredentialPattern CredentialPattern
+	}{
+		{
+			name: "Given a well formed host, it returns the corresponding CredentialPattern",
+			host: "github.com",
+			wantCredentialPattern: CredentialPattern{
+				pattern:     "https://github.com",
+				allMatching: false,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			credentialPattern := CredentialPatternFromHost(tt.host)
+			require.Equal(t, tt.wantCredentialPattern, credentialPattern)
+		})
+	}
+}
+
+func createCommandContext(t *testing.T, exitStatus int, stdout, stderr string) (*exec.Cmd, commandCtx) {
+	cmd := exec.CommandContext(context.Background(), os.Args[0], "-test.run=TestHelperProcess", "--")
+	cmd.Env = []string{
+		"GH_WANT_HELPER_PROCESS=1",
+		fmt.Sprintf("GH_HELPER_PROCESS_STDOUT=%s", stdout),
+		fmt.Sprintf("GH_HELPER_PROCESS_STDERR=%s", stderr),
+		fmt.Sprintf("GH_HELPER_PROCESS_EXIT_STATUS=%v", exitStatus),
+	}
+	return cmd, func(ctx context.Context, exe string, args ...string) *exec.Cmd {
+		cmd.Args = append(cmd.Args, exe)
+		cmd.Args = append(cmd.Args, args...)
+		return cmd
+	}
+}
+
+func createMockedCommandContext(t *testing.T, commands mockedCommands) commandCtx {
+	marshaledCommands, err := json.Marshal(commands)
+	require.NoError(t, err)
+
+	// invokes helper within current test binary, emulating desired behavior
+	return func(ctx context.Context, exe string, args ...string) *exec.Cmd {
+		cmd := exec.CommandContext(context.Background(), os.Args[0], "-test.run=TestCommandMocking", "--")
+		cmd.Env = []string{
+			"GH_WANT_HELPER_PROCESS_RICH=1",
+			fmt.Sprintf("GH_HELPER_PROCESS_RICH_COMMANDS=%s", string(marshaledCommands)),
+		}
+
+		cmd.Args = append(cmd.Args, exe)
+		cmd.Args = append(cmd.Args, args...)
+		return cmd
+	}
 }

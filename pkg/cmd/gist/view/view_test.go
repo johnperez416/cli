@@ -8,13 +8,15 @@ import (
 	"time"
 
 	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/gh"
+	"github.com/cli/cli/v2/internal/prompter"
 	"github.com/cli/cli/v2/pkg/cmd/gist/shared"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/httpmock"
 	"github.com/cli/cli/v2/pkg/iostreams"
-	"github.com/cli/cli/v2/pkg/prompt"
 	"github.com/google/shlex"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestNewCmdView(t *testing.T) {
@@ -93,6 +95,7 @@ func TestNewCmdView(t *testing.T) {
 				gotOpts = opts
 				return nil
 			})
+
 			cmd.SetArgs(argv)
 			cmd.SetIn(&bytes.Buffer{})
 			cmd.SetOut(&bytes.Buffer{})
@@ -113,25 +116,28 @@ func Test_viewRun(t *testing.T) {
 		name         string
 		opts         *ViewOptions
 		wantOut      string
-		gist         *shared.Gist
-		wantErr      bool
+		mockGist     *shared.Gist
 		mockGistList bool
+		isTTY        bool
+		wantErr      string
 	}{
 		{
-			name: "no such gist",
+			name:  "no such gist",
+			isTTY: false,
 			opts: &ViewOptions{
 				Selector:  "1234",
 				ListFiles: false,
 			},
-			wantErr: true,
+			wantErr: "not found",
 		},
 		{
-			name: "one file",
+			name:  "one file",
+			isTTY: true,
 			opts: &ViewOptions{
 				Selector:  "1234",
 				ListFiles: false,
 			},
-			gist: &shared.Gist{
+			mockGist: &shared.Gist{
 				Files: map[string]*shared.GistFile{
 					"cicada.txt": {
 						Content: "bwhiizzzbwhuiiizzzz",
@@ -142,13 +148,14 @@ func Test_viewRun(t *testing.T) {
 			wantOut: "bwhiizzzbwhuiiizzzz\n",
 		},
 		{
-			name: "one file, no ID supplied",
+			name:  "one file, no ID supplied",
+			isTTY: true,
 			opts: &ViewOptions{
 				Selector:  "",
 				ListFiles: false,
 			},
 			mockGistList: true,
-			gist: &shared.Gist{
+			mockGist: &shared.Gist{
 				Files: map[string]*shared.GistFile{
 					"cicada.txt": {
 						Content: "test interactive mode",
@@ -159,13 +166,19 @@ func Test_viewRun(t *testing.T) {
 			wantOut: "test interactive mode\n",
 		},
 		{
-			name: "filename selected",
+			name:    "no arguments notty",
+			isTTY:   false,
+			wantErr: "gist ID or URL required when not running interactively",
+		},
+		{
+			name:  "filename selected",
+			isTTY: true,
 			opts: &ViewOptions{
 				Selector:  "1234",
 				Filename:  "cicada.txt",
 				ListFiles: false,
 			},
-			gist: &shared.Gist{
+			mockGist: &shared.Gist{
 				Files: map[string]*shared.GistFile{
 					"cicada.txt": {
 						Content: "bwhiizzzbwhuiiizzzz",
@@ -180,14 +193,15 @@ func Test_viewRun(t *testing.T) {
 			wantOut: "bwhiizzzbwhuiiizzzz\n",
 		},
 		{
-			name: "filename selected, raw",
+			name:  "filename selected, raw",
+			isTTY: true,
 			opts: &ViewOptions{
 				Selector:  "1234",
 				Filename:  "cicada.txt",
 				Raw:       true,
 				ListFiles: false,
 			},
-			gist: &shared.Gist{
+			mockGist: &shared.Gist{
 				Files: map[string]*shared.GistFile{
 					"cicada.txt": {
 						Content: "bwhiizzzbwhuiiizzzz",
@@ -202,12 +216,13 @@ func Test_viewRun(t *testing.T) {
 			wantOut: "bwhiizzzbwhuiiizzzz\n",
 		},
 		{
-			name: "multiple files, no description",
+			name:  "multiple files, no description",
+			isTTY: true,
 			opts: &ViewOptions{
 				Selector:  "1234",
 				ListFiles: false,
 			},
-			gist: &shared.Gist{
+			mockGist: &shared.Gist{
 				Files: map[string]*shared.GistFile{
 					"cicada.txt": {
 						Content: "bwhiizzzbwhuiiizzzz",
@@ -219,15 +234,16 @@ func Test_viewRun(t *testing.T) {
 					},
 				},
 			},
-			wantOut: "cicada.txt\n\nbwhiizzzbwhuiiizzzz\n\nfoo.md\n\n\n  # foo                                                                       \n\n",
+			wantOut: "cicada.txt\n\nbwhiizzzbwhuiiizzzz\n\nfoo.md\n\n\n  # foo                                                                           \n\n",
 		},
 		{
-			name: "multiple files, trailing newlines",
+			name:  "multiple files, trailing newlines",
+			isTTY: true,
 			opts: &ViewOptions{
 				Selector:  "1234",
 				ListFiles: false,
 			},
-			gist: &shared.Gist{
+			mockGist: &shared.Gist{
 				Files: map[string]*shared.GistFile{
 					"cicada.txt": {
 						Content: "bwhiizzzbwhuiiizzzz\n",
@@ -242,12 +258,13 @@ func Test_viewRun(t *testing.T) {
 			wantOut: "cicada.txt\n\nbwhiizzzbwhuiiizzzz\n\nfoo.txt\n\nbar\n",
 		},
 		{
-			name: "multiple files, description",
+			name:  "multiple files, description",
+			isTTY: true,
 			opts: &ViewOptions{
 				Selector:  "1234",
 				ListFiles: false,
 			},
-			gist: &shared.Gist{
+			mockGist: &shared.Gist{
 				Description: "some files",
 				Files: map[string]*shared.GistFile{
 					"cicada.txt": {
@@ -260,16 +277,17 @@ func Test_viewRun(t *testing.T) {
 					},
 				},
 			},
-			wantOut: "some files\n\ncicada.txt\n\nbwhiizzzbwhuiiizzzz\n\nfoo.md\n\n\n                                                                              \n  • foo                                                                       \n\n",
+			wantOut: "some files\n\ncicada.txt\n\nbwhiizzzbwhuiiizzzz\n\nfoo.md\n\n\n                                                                                  \n  • foo                                                                           \n\n",
 		},
 		{
-			name: "multiple files, raw",
+			name:  "multiple files, raw",
+			isTTY: true,
 			opts: &ViewOptions{
 				Selector:  "1234",
 				Raw:       true,
 				ListFiles: false,
 			},
-			gist: &shared.Gist{
+			mockGist: &shared.Gist{
 				Description: "some files",
 				Files: map[string]*shared.GistFile{
 					"cicada.txt": {
@@ -285,13 +303,14 @@ func Test_viewRun(t *testing.T) {
 			wantOut: "some files\n\ncicada.txt\n\nbwhiizzzbwhuiiizzzz\n\nfoo.md\n\n- foo\n",
 		},
 		{
-			name: "one file, list files",
+			name:  "one file, list files",
+			isTTY: true,
 			opts: &ViewOptions{
 				Selector:  "1234",
 				Raw:       false,
 				ListFiles: true,
 			},
-			gist: &shared.Gist{
+			mockGist: &shared.Gist{
 				Description: "some files",
 				Files: map[string]*shared.GistFile{
 					"cicada.txt": {
@@ -303,13 +322,14 @@ func Test_viewRun(t *testing.T) {
 			wantOut: "cicada.txt\n",
 		},
 		{
-			name: "multiple file, list files",
+			name:  "multiple file, list files",
+			isTTY: true,
 			opts: &ViewOptions{
 				Selector:  "1234",
 				Raw:       false,
 				ListFiles: true,
 			},
-			gist: &shared.Gist{
+			mockGist: &shared.Gist{
 				Description: "some files",
 				Files: map[string]*shared.GistFile{
 					"cicada.txt": {
@@ -328,12 +348,16 @@ func Test_viewRun(t *testing.T) {
 
 	for _, tt := range tests {
 		reg := &httpmock.Registry{}
-		if tt.gist == nil {
+		if tt.mockGist == nil {
 			reg.Register(httpmock.REST("GET", "gists/1234"),
 				httpmock.StatusStringResponse(404, "Not Found"))
 		} else {
 			reg.Register(httpmock.REST("GET", "gists/1234"),
-				httpmock.JSONResponse(tt.gist))
+				httpmock.JSONResponse(tt.mockGist))
+		}
+
+		if tt.opts == nil {
+			tt.opts = &ViewOptions{}
 		}
 
 		if tt.mockGistList {
@@ -355,130 +379,38 @@ func Test_viewRun(t *testing.T) {
 				)),
 			)
 
-			//nolint:staticcheck // SA1019: prompt.NewAskStubber is deprecated: use PrompterMock
-			as := prompt.NewAskStubber(t)
-			as.StubPrompt("Select a gist").AnswerDefault()
-		}
-
-		if tt.opts == nil {
-			tt.opts = &ViewOptions{}
+			pm := prompter.NewMockPrompter(t)
+			pm.RegisterSelect("Select a gist", []string{"cool.txt  about 6 hours ago"}, func(_, _ string, opts []string) (int, error) {
+				return 0, nil
+			})
+			tt.opts.Prompter = pm
 		}
 
 		tt.opts.HttpClient = func() (*http.Client, error) {
 			return &http.Client{Transport: reg}, nil
 		}
 
-		tt.opts.Config = func() (config.Config, error) {
+		tt.opts.Config = func() (gh.Config, error) {
 			return config.NewBlankConfig(), nil
 		}
 
 		ios, _, stdout, _ := iostreams.Test()
-		ios.SetStdoutTTY(true)
+		ios.SetStdoutTTY(tt.isTTY)
+		ios.SetStdinTTY(tt.isTTY)
+		ios.SetStderrTTY(tt.isTTY)
+
 		tt.opts.IO = ios
 
 		t.Run(tt.name, func(t *testing.T) {
 			err := viewRun(tt.opts)
-			if tt.wantErr {
-				assert.Error(t, err)
+			if tt.wantErr != "" {
+				require.EqualError(t, err, tt.wantErr)
 				return
+			} else {
+				require.NoError(t, err)
 			}
-			assert.NoError(t, err)
 
 			assert.Equal(t, tt.wantOut, stdout.String())
-			reg.Verify(t)
-		})
-	}
-}
-
-func Test_promptGists(t *testing.T) {
-	tests := []struct {
-		name     string
-		askStubs func(as *prompt.AskStubber)
-		response string
-		wantOut  string
-		gist     *shared.Gist
-		wantErr  bool
-	}{
-		{
-			name: "multiple files, select first gist",
-			askStubs: func(as *prompt.AskStubber) {
-				as.StubPrompt("Select a gist").AnswerWith("cool.txt  about 6 hours ago")
-			},
-			response: `{ "data": { "viewer": { "gists": { "nodes": [
-							{
-								"name": "gistid1",
-								"files": [{ "name": "cool.txt" }],
-								"description": "",
-								"updatedAt": "%[1]v",
-								"isPublic": true
-							},
-							{
-								"name": "gistid2",
-								"files": [{ "name": "gistfile0.txt" }],
-								"description": "",
-								"updatedAt": "%[1]v",
-								"isPublic": true
-							}
-						] } } } }`,
-			wantOut: "gistid1",
-		},
-		{
-			name: "multiple files, select second gist",
-			askStubs: func(as *prompt.AskStubber) {
-				as.StubPrompt("Select a gist").AnswerWith("gistfile0.txt  about 6 hours ago")
-			},
-			response: `{ "data": { "viewer": { "gists": { "nodes": [
-							{
-								"name": "gistid1",
-								"files": [{ "name": "cool.txt" }],
-								"description": "",
-								"updatedAt": "%[1]v",
-								"isPublic": true
-							},
-							{
-								"name": "gistid2",
-								"files": [{ "name": "gistfile0.txt" }],
-								"description": "",
-								"updatedAt": "%[1]v",
-								"isPublic": true
-							}
-						] } } } }`,
-			wantOut: "gistid2",
-		},
-		{
-			name:     "no files",
-			response: `{ "data": { "viewer": { "gists": { "nodes": [] } } } }`,
-			wantOut:  "",
-		},
-	}
-
-	ios, _, _, _ := iostreams.Test()
-
-	for _, tt := range tests {
-		reg := &httpmock.Registry{}
-
-		const query = `query GistList\b`
-		sixHours, _ := time.ParseDuration("6h")
-		sixHoursAgo := time.Now().Add(-sixHours)
-		reg.Register(
-			httpmock.GraphQL(query),
-			httpmock.StringResponse(fmt.Sprintf(
-				tt.response,
-				sixHoursAgo.Format(time.RFC3339),
-			)),
-		)
-		client := &http.Client{Transport: reg}
-
-		t.Run(tt.name, func(t *testing.T) {
-			//nolint:staticcheck // SA1019: prompt.NewAskStubber is deprecated: use PrompterMock
-			as := prompt.NewAskStubber(t)
-			if tt.askStubs != nil {
-				tt.askStubs(as)
-			}
-
-			gistID, err := promptGists(client, "github.com", ios.ColorScheme())
-			assert.NoError(t, err)
-			assert.Equal(t, tt.wantOut, gistID)
 			reg.Verify(t)
 		})
 	}

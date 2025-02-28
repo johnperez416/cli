@@ -9,15 +9,15 @@ import (
 	"os"
 	"strings"
 
-	"github.com/AlecAivazis/survey/v2"
+	"github.com/cli/cli/v2/internal/prompter"
+
 	"github.com/MakeNowJust/heredoc"
 	"github.com/cli/cli/v2/api"
-	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/gh"
 	"github.com/cli/cli/v2/internal/ghrepo"
 	"github.com/cli/cli/v2/pkg/cmd/secret/shared"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
-	"github.com/cli/cli/v2/pkg/prompt"
 	"github.com/hashicorp/go-multierror"
 	"github.com/joho/godotenv"
 	"github.com/spf13/cobra"
@@ -27,8 +27,9 @@ import (
 type SetOptions struct {
 	HttpClient func() (*http.Client, error)
 	IO         *iostreams.IOStreams
-	Config     func() (config.Config, error)
+	Config     func() (gh.Config, error)
 	BaseRepo   func() (ghrepo.Interface, error)
+	Prompter   prompter.Prompter
 
 	RandomOverride func() io.Reader
 
@@ -49,6 +50,7 @@ func NewCmdSet(f *cmdutil.Factory, runF func(*SetOptions) error) *cobra.Command 
 		IO:         f.IOStreams,
 		Config:     f.Config,
 		HttpClient: f.HttpClient,
+		Prompter:   f.Prompter,
 	}
 
 	cmd := &cobra.Command{
@@ -56,9 +58,9 @@ func NewCmdSet(f *cmdutil.Factory, runF func(*SetOptions) error) *cobra.Command 
 		Short: "Create or update secrets",
 		Long: heredoc.Doc(`
 			Set a value for a secret on one of the following levels:
-			- repository (default): available to Actions runs or Dependabot in a repository
-			- environment: available to Actions runs for a deployment environment in a repository
-			- organization: available to Actions runs, Dependabot, or Codespaces within an organization
+			- repository (default): available to GitHub Actions runs or Dependabot in a repository
+			- environment: available to GitHub Actions runs for a deployment environment in a repository
+			- organization: available to GitHub Actions runs, Dependabot, or Codespaces within an organization
 			- user: available to Codespaces for your user
 
 			Organization and user secrets can optionally be restricted to only be available to
@@ -72,6 +74,9 @@ func NewCmdSet(f *cmdutil.Factory, runF func(*SetOptions) error) *cobra.Command 
 
 			# Read secret value from an environment variable
 			$ gh secret set MYSECRET --body "$ENV_VALUE"
+
+			# Set secret for a specific remote repository
+			$ gh secret set MYSECRET --repo origin/repo --body "$ENV_VALUE"
 
 			# Read secret value from a file
 			$ gh secret set MYSECRET < myfile.txt
@@ -93,11 +98,25 @@ func NewCmdSet(f *cmdutil.Factory, runF func(*SetOptions) error) *cobra.Command 
 
 			# Set multiple secrets imported from the ".env" file
 			$ gh secret set -f .env
+
+			# Set multiple secrets from stdin
+			$ gh secret set -f - < myfile.txt
 		`),
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// support `-R, --repo` override
+			// If the user specified a repo directly, then we're using the OverrideBaseRepoFunc set by EnableRepoOverride
+			// So there's no reason to use the specialised BaseRepoFunc that requires remote disambiguation.
 			opts.BaseRepo = f.BaseRepo
+			if !cmd.Flags().Changed("repo") {
+				// If they haven't specified a repo directly, then we will wrap the BaseRepoFunc in one that errors if
+				// there might be multiple valid remotes.
+				opts.BaseRepo = shared.RequireNoAmbiguityBaseRepoFunc(opts.BaseRepo, f.Remotes)
+				// But if we are able to prompt, then we will wrap that up in a BaseRepoFunc that can prompt the user to
+				// resolve the ambiguity.
+				if opts.IO.CanPrompt() {
+					opts.BaseRepo = shared.PromptWhenAmbiguousBaseRepoFunc(opts.BaseRepo, f.IOStreams, f.Prompter)
+				}
+			}
 
 			if err := cmdutil.MutuallyExclusive("specify only one of `--org`, `--env`, or `--user`", opts.OrgName != "", opts.EnvName != "", opts.UserSecrets); err != nil {
 				return err
@@ -151,7 +170,7 @@ func NewCmdSet(f *cmdutil.Factory, runF func(*SetOptions) error) *cobra.Command 
 	cmdutil.StringEnumFlag(cmd, &opts.Visibility, "visibility", "v", shared.Private, []string{shared.All, shared.Private, shared.Selected}, "Set visibility for an organization secret")
 	cmd.Flags().StringSliceVarP(&opts.RepositoryNames, "repos", "r", []string{}, "List of `repositories` that can access an organization or user secret")
 	cmd.Flags().StringVarP(&opts.Body, "body", "b", "", "The value for the secret (reads from standard input if not specified)")
-	cmd.Flags().BoolVar(&opts.DoNotStore, "no-store", false, "Print the encrypted, base64-encoded value instead of storing it on Github")
+	cmd.Flags().BoolVar(&opts.DoNotStore, "no-store", false, "Print the encrypted, base64-encoded value instead of storing it on GitHub")
 	cmd.Flags().StringVarP(&opts.EnvFile, "env-file", "f", "", "Load secret names and values from a dotenv-formatted `file`")
 	cmdutil.StringEnumFlag(cmd, &opts.Application, "app", "a", "", []string{shared.Actions, shared.Codespaces, shared.Dependabot}, "Set the application for a secret")
 
@@ -159,6 +178,27 @@ func NewCmdSet(f *cmdutil.Factory, runF func(*SetOptions) error) *cobra.Command 
 }
 
 func setRun(opts *SetOptions) error {
+	orgName := opts.OrgName
+	envName := opts.EnvName
+
+	var host string
+	var baseRepo ghrepo.Interface
+	if orgName == "" && !opts.UserSecrets {
+		var err error
+		baseRepo, err = opts.BaseRepo()
+		if err != nil {
+			return err
+		}
+
+		host = baseRepo.RepoHost()
+	} else {
+		cfg, err := opts.Config()
+		if err != nil {
+			return err
+		}
+		host, _ = cfg.Authentication().DefaultHost()
+	}
+
 	secrets, err := getSecretsFromOptions(opts)
 	if err != nil {
 		return err
@@ -169,25 +209,6 @@ func setRun(opts *SetOptions) error {
 		return fmt.Errorf("could not create http client: %w", err)
 	}
 	client := api.NewClientFromHTTP(c)
-
-	orgName := opts.OrgName
-	envName := opts.EnvName
-
-	var host string
-	var baseRepo ghrepo.Interface
-	if orgName == "" && !opts.UserSecrets {
-		baseRepo, err = opts.BaseRepo()
-		if err != nil {
-			return fmt.Errorf("could not determine base repo: %w", err)
-		}
-		host = baseRepo.RepoHost()
-	} else {
-		cfg, err := opts.Config()
-		if err != nil {
-			return err
-		}
-		host, _ = cfg.DefaultHost()
-	}
 
 	secretEntity, err := shared.GetSecretEntity(orgName, envName, opts.UserSecrets)
 	if err != nil {
@@ -372,11 +393,7 @@ func getBody(opts *SetOptions) ([]byte, error) {
 	}
 
 	if opts.IO.CanPrompt() {
-		var bodyInput string
-		//nolint:staticcheck // SA1019: prompt.SurveyAskOne is deprecated: use Prompter
-		err := prompt.SurveyAskOne(&survey.Password{
-			Message: "Paste your secret",
-		}, &bodyInput)
+		bodyInput, err := opts.Prompter.Password("Paste your secret:")
 		if err != nil {
 			return nil, err
 		}
@@ -407,7 +424,7 @@ func mapRepoNamesToIDs(client *api.Client, host, defaultOwner string, repository
 		}
 		repos = append(repos, repo)
 	}
-	repositoryIDs, err := mapRepoToID(client, host, repos)
+	repositoryIDs, err := api.GetRepoIDs(client, host, repos)
 	if err != nil {
 		return nil, fmt.Errorf("failed to look up IDs for repositories %v: %w", repositoryNames, err)
 	}

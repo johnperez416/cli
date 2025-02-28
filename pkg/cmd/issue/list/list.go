@@ -10,12 +10,11 @@ import (
 	"github.com/MakeNowJust/heredoc"
 	"github.com/cli/cli/v2/api"
 	"github.com/cli/cli/v2/internal/browser"
-	"github.com/cli/cli/v2/internal/config"
 	fd "github.com/cli/cli/v2/internal/featuredetection"
+	"github.com/cli/cli/v2/internal/gh"
 	"github.com/cli/cli/v2/internal/ghrepo"
 	"github.com/cli/cli/v2/internal/text"
 	issueShared "github.com/cli/cli/v2/pkg/cmd/issue/shared"
-	"github.com/cli/cli/v2/pkg/cmd/pr/shared"
 	prShared "github.com/cli/cli/v2/pkg/cmd/pr/shared"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
@@ -25,7 +24,7 @@ import (
 
 type ListOptions struct {
 	HttpClient func() (*http.Client, error)
-	Config     func() (config.Config, error)
+	Config     func() (gh.Config, error)
 	IO         *iostreams.IOStreams
 	BaseRepo   func() (ghrepo.Interface, error)
 	Browser    browser.Browser
@@ -60,7 +59,7 @@ func NewCmdList(f *cmdutil.Factory, runF func(*ListOptions) error) *cobra.Comman
 		Use:   "list",
 		Short: "List issues in a repository",
 		Long: heredoc.Doc(`
-			List issues in a GitHub repository.
+			List issues in a GitHub repository. By default, this only lists open issues.
 
 			The search query syntax is documented here:
 			<https://docs.github.com/en/search-github/searching-on-github/searching-issues-and-pull-requests>
@@ -71,6 +70,7 @@ func NewCmdList(f *cmdutil.Factory, runF func(*ListOptions) error) *cobra.Comman
 			$ gh issue list --assignee "@me"
 			$ gh issue list --milestone "The big 1.0"
 			$ gh issue list --search "error no:assignee sort:created-asc"
+			$ gh issue list --state all
 		`),
 		Aliases: []string{"ls"},
 		Args:    cmdutil.NoArgsQuoteReminder,
@@ -133,7 +133,7 @@ func listRun(opts *ListOptions) error {
 	}
 
 	issueState := strings.ToLower(opts.State)
-	if issueState == "open" && shared.QueryHasStateClause(opts.Search) {
+	if issueState == "open" && prShared.QueryHasStateClause(opts.Search) {
 		issueState = ""
 	}
 
@@ -228,7 +228,7 @@ func issueList(client *http.Client, repo ghrepo.Interface, filters prShared.Filt
 	}
 
 	var err error
-	meReplacer := shared.NewMeReplacer(apiClient, repo.RepoHost())
+	meReplacer := prShared.NewMeReplacer(apiClient, repo.RepoHost())
 	filters.Assignee, err = meReplacer.Replace(filters.Assignee)
 	if err != nil {
 		return nil, err

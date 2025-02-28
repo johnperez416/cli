@@ -7,9 +7,8 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/AlecAivazis/survey/v2"
 	"github.com/cli/cli/v2/api"
-	"github.com/cli/cli/v2/internal/config"
+	"github.com/cli/cli/v2/internal/gh"
 	"github.com/cli/cli/v2/internal/ghrepo"
 	"github.com/cli/cli/v2/internal/text"
 	"github.com/cli/cli/v2/pkg/cmdutil"
@@ -17,6 +16,8 @@ import (
 	"github.com/cli/cli/v2/pkg/surveyext"
 	"github.com/spf13/cobra"
 )
+
+var errNoUserComments = errors.New("no comments found for current user")
 
 type InputType int
 
@@ -33,19 +34,21 @@ type Commentable interface {
 }
 
 type CommentableOptions struct {
-	IO                    *iostreams.IOStreams
-	HttpClient            func() (*http.Client, error)
-	RetrieveCommentable   func() (Commentable, ghrepo.Interface, error)
-	EditSurvey            func(string) (string, error)
-	InteractiveEditSurvey func(string) (string, error)
-	ConfirmSubmitSurvey   func() (bool, error)
-	OpenInBrowser         func(string) error
-	Interactive           bool
-	InputType             InputType
-	Body                  string
-	EditLast              bool
-	Quiet                 bool
-	Host                  string
+	IO                        *iostreams.IOStreams
+	HttpClient                func() (*http.Client, error)
+	RetrieveCommentable       func() (Commentable, ghrepo.Interface, error)
+	EditSurvey                func(string) (string, error)
+	InteractiveEditSurvey     func(string) (string, error)
+	ConfirmSubmitSurvey       func() (bool, error)
+	ConfirmCreateIfNoneSurvey func() (bool, error)
+	OpenInBrowser             func(string) error
+	Interactive               bool
+	InputType                 InputType
+	Body                      string
+	EditLast                  bool
+	CreateIfNone              bool
+	Quiet                     bool
+	Host                      string
 }
 
 func CommentablePreRun(cmd *cobra.Command, opts *CommentableOptions) error {
@@ -67,6 +70,10 @@ func CommentablePreRun(cmd *cobra.Command, opts *CommentableOptions) error {
 		inputFlags++
 	}
 
+	if opts.CreateIfNone && !opts.EditLast {
+		return cmdutil.FlagErrorf("`--create-if-none` can only be used with `--edit-last`")
+	}
+
 	if inputFlags == 0 {
 		if !opts.IO.CanPrompt() {
 			return cmdutil.FlagErrorf("flags required when not running interactively")
@@ -86,7 +93,24 @@ func CommentableRun(opts *CommentableOptions) error {
 	}
 	opts.Host = repo.RepoHost()
 	if opts.EditLast {
-		return updateComment(commentable, opts)
+		err := updateComment(commentable, opts)
+		if !errors.Is(err, errNoUserComments) {
+			return err
+		}
+
+		if opts.Interactive {
+			if opts.CreateIfNone {
+				fmt.Fprintln(opts.IO.ErrOut, "No comments found. Creating a new comment.")
+			} else {
+				ok, err := opts.ConfirmCreateIfNoneSurvey()
+				if err != nil {
+					return err
+				}
+				if !ok {
+					return errNoUserComments
+				}
+			}
+		}
 	}
 	return createComment(commentable, opts)
 }
@@ -145,7 +169,7 @@ func createComment(commentable Commentable, opts *CommentableOptions) error {
 func updateComment(commentable Commentable, opts *CommentableOptions) error {
 	comments := commentable.CurrentUserComments()
 	if len(comments) == 0 {
-		return fmt.Errorf("no comments found for current user")
+		return errNoUserComments
 	}
 
 	lastComment := &comments[len(comments)-1]
@@ -201,17 +225,13 @@ func updateComment(commentable Commentable, opts *CommentableOptions) error {
 	return nil
 }
 
-func CommentableConfirmSubmitSurvey() (bool, error) {
-	var confirm bool
-	submit := &survey.Confirm{
-		Message: "Submit?",
-		Default: true,
+func CommentableConfirmSubmitSurvey(p Prompt) func() (bool, error) {
+	return func() (bool, error) {
+		return p.Confirm("Submit?", true)
 	}
-	err := survey.AskOne(submit, &confirm)
-	return confirm, err
 }
 
-func CommentableInteractiveEditSurvey(cf func() (config.Config, error), io *iostreams.IOStreams) func(string) (string, error) {
+func CommentableInteractiveEditSurvey(cf func() (gh.Config, error), io *iostreams.IOStreams) func(string) (string, error) {
 	return func(initialValue string) (string, error) {
 		editorCommand, err := cmdutil.DetermineEditor(cf)
 		if err != nil {
@@ -224,7 +244,13 @@ func CommentableInteractiveEditSurvey(cf func() (config.Config, error), io *iost
 	}
 }
 
-func CommentableEditSurvey(cf func() (config.Config, error), io *iostreams.IOStreams) func(string) (string, error) {
+func CommentableInteractiveCreateIfNoneSurvey(p Prompt) func() (bool, error) {
+	return func() (bool, error) {
+		return p.Confirm("No comments found. Create one?", true)
+	}
+}
+
+func CommentableEditSurvey(cf func() (gh.Config, error), io *iostreams.IOStreams) func(string) (string, error) {
 	return func(initialValue string) (string, error) {
 		editorCommand, err := cmdutil.DetermineEditor(cf)
 		if err != nil {
