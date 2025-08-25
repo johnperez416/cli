@@ -95,7 +95,7 @@ Some packages may only be included on certain architectures or operating systems
 - [github.com/go-openapi/strfmt](https://pkg.go.dev/github.com/go-openapi/strfmt) ([Apache-2.0](https://github.com/go-openapi/strfmt/blob/v0.23.0/LICENSE))
 - [github.com/go-openapi/swag](https://pkg.go.dev/github.com/go-openapi/swag) ([Apache-2.0](https://github.com/go-openapi/swag/blob/v0.23.1/LICENSE))
 - [github.com/go-openapi/validate](https://pkg.go.dev/github.com/go-openapi/validate) ([Apache-2.0](https://github.com/go-openapi/validate/blob/v0.24.0/LICENSE))
-- [github.com/go-viper/mapstructure/v2](https://pkg.go.dev/github.com/go-viper/mapstructure/v2) ([MIT](https://github.com/go-viper/mapstructure/blob/v2.3.0/LICENSE))
+- [github.com/go-viper/mapstructure/v2](https://pkg.go.dev/github.com/go-viper/mapstructure/v2) ([MIT](https://github.com/go-viper/mapstructure/blob/v2.4.0/LICENSE))
 - [github.com/golang/groupcache/lru](https://pkg.go.dev/github.com/golang/groupcache/lru) ([Apache-2.0](https://github.com/golang/groupcache/blob/2c02b8208cf8/LICENSE))
 - [github.com/golang/snappy](https://pkg.go.dev/github.com/golang/snappy) ([BSD-3-Clause](https://github.com/golang/snappy/blob/v1.0.0/LICENSE))
 - [github.com/google/certificate-transparency-go](https://pkg.go.dev/github.com/google/certificate-transparency-go) ([Apache-2.0](https://github.com/google/certificate-transparency-go/blob/v1.3.2/LICENSE))
